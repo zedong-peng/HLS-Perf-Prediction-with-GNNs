@@ -103,12 +103,19 @@ class PygGraphPropPredDataset(InMemoryDataset):
         if self.meta_info['additional node files'] == 'None':
             additional_node_files = []
         else:
-            additional_node_files = self.meta_info['additional node files'].split(',')
+            # AttributeError: 'float' object has no attribute 'split's
+            # print("DEBUG: self.meta_info =", self.meta_info)
+            # print("DEBUG: self.meta_info['additional node files'] =", self.meta_info.get('additional node files'))
+            additional_node_files = self.meta_info['additional node files']
+            if pd.isna(additional_node_files):
+                additional_node_files = []
+            else:
+                additional_node_files = str(additional_node_files).split(',')
 
-        if self.meta_info['additional edge files'] == 'None':
-            additional_edge_files = []
-        else:
+        try:
             additional_edge_files = self.meta_info['additional edge files'].split(',')
+        except:
+            additional_edge_files = []
 
         data_list = read_graph_pyg(self.raw_dir, add_inverse_edge = add_inverse_edge, additional_node_files = additional_node_files, additional_edge_files = additional_edge_files, binary=self.binary)
 

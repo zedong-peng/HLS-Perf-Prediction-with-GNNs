@@ -13,6 +13,7 @@ import numpy as np
 import json
 import operator
 from functools import reduce
+import os
 
 from dataset_pyg import PygGraphPropPredDataset
 from evaluate import Evaluator
@@ -156,6 +157,7 @@ def main():
         test_loss=test_perf[dataset.eval_metric]
         if test_loss<=np.min(np.array(test_curve)):
             PATH='model/'+args.dataset + '_pna_layer_'+ str(args.num_layer)+'_model.pt'
+            os.makedirs(os.path.dirname(PATH), exist_ok=True)  # Ensure the directory exists
             torch.save({'epoch': epoch,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
@@ -176,6 +178,8 @@ def main():
     print('Best validation score: {}'.format(valid_curve[best_val_epoch]))
     print('Test score: {}'.format(test_curve[best_val_epoch]))
 
+    # make sure the directory exists
+    os.makedirs('result', exist_ok=True)
     f = open('result/'+args.dataset + '_pna_layer_'+str(args.num_layer)+'.json', 'w')
     result=dict(val=valid_curve[best_val_epoch], \
         test=test_curve[best_val_epoch],train=train_curve[best_val_epoch], \
