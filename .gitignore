@@ -5,3 +5,5 @@ GNN/__pycache__/
 **/*.csv
 **/*.json
 **/.DS_Store
+visulization/
+'Node-level task/'
