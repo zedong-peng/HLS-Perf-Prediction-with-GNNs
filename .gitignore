@@ -3,3 +3,5 @@ GNN/__pycache__/
 *.adb
 *.gz
 *.csv
+*.json
+**/.DS_Store
