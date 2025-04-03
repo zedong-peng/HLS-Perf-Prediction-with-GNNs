@@ -1,7 +1,7 @@
 import torch
-from features_binary import get_node_feature_dims, get_edge_feature_dims 
-#from features_numerical import get_node_feature_dims, get_edge_feature_dims 
-#from features import get_node_feature_dims, get_edge_feature_dims 
+# from features_binary import get_node_feature_dims, get_edge_feature_dims
+from features_numerical import get_node_feature_dims, get_edge_feature_dims
+# from features import get_node_feature_dims, get_edge_feature_dims
 
 full_node_feature_dims = get_node_feature_dims()
 full_edge_feature_dims = get_edge_feature_dims()

@@ -1,2 +1,5 @@
 GNN/__pycache__/
 *.pt
+*.adb
+*.gz
+*.csv
