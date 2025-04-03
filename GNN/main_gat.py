@@ -135,7 +135,7 @@ def main():
 
         print('Evaluating...')
         train_perf, _, _ = eval(model, device, train_loader, evaluator)
-        valid_perf, v_true,  v_pred = eval(model, device, valid_loader, evaluator)
+        valid_perf, v_true,  v_pred= eval(model, device, valid_loader, evaluator)
         test_perf, t_true, t_pred = eval(model, device, test_loader, evaluator)
 
         print({'Train': train_perf, 'Validation': valid_perf, 'Test': test_perf})
@@ -170,7 +170,7 @@ def main():
     print('Best validation score: {}'.format(valid_curve[best_val_epoch]))
     print('Test score: {}'.format(test_curve[best_val_epoch]))
 
-    f = open(args.dataset + '_gat_layer_'+str(args.num_layer)+'.json', 'w')
+    f = open('result/'+args.dataset + '_gat_layer_'+str(args.num_layer)+'.json', 'w')
     result=dict(val=valid_curve[best_val_epoch], \
         test=test_curve[best_val_epoch],train=train_curve[best_val_epoch], \
         test_pred=test_predict_value, value_pred=valid_predict_value, 

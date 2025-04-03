@@ -2,9 +2,10 @@ import torch
 from torch_geometric.data import DataLoader
 import torch.optim as optim
 import torch.nn.functional as F
-from pna import Net
 from torch_geometric.utils import degree
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import torch_geometric.transforms as T
+from torch.cuda.amp import GradScaler, autocast
 
 from tqdm import tqdm
 import argparse
@@ -21,7 +22,7 @@ from evaluate import Evaluator
 cls_criterion = torch.nn.BCEWithLogitsLoss()
 reg_criterion = torch.nn.MSELoss()
 
-def train(model, device, loader, optimizer, task_type):
+def train(model, device, loader, optimizer, task_type, scaler=None):
     model.train()
 
     for step, batch in enumerate(tqdm(loader, desc="Iteration")):
@@ -30,16 +31,33 @@ def train(model, device, loader, optimizer, task_type):
         if batch.x.shape[0] == 1 or batch.batch[-1] == 0:
             pass
         else:
-            pred = model(batch)
-            optimizer.zero_grad()
-            ## ignore nan targets (unlabeled) when computing training loss.
-            is_labeled = batch.y == batch.y
-            if "classification" in task_type: 
-                loss = cls_criterion(pred.to(torch.float32)[is_labeled], batch.y.to(torch.float32)[is_labeled])
+            # 使用混合精度训练
+            if scaler is not None:
+                with autocast():
+                    pred = model(batch)
+                    ## ignore nan targets (unlabeled) when computing training loss.
+                    is_labeled = batch.y == batch.y
+                    if "classification" in task_type: 
+                        loss = cls_criterion(pred.to(torch.float32)[is_labeled], batch.y.to(torch.float32)[is_labeled])
+                    else:
+                        loss = reg_criterion(pred.to(torch.float32)[is_labeled], batch.y.to(torch.float32)[is_labeled])
+                
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
             else:
-                loss = reg_criterion(pred.to(torch.float32)[is_labeled], batch.y.to(torch.float32)[is_labeled])
-            loss.backward()
-            optimizer.step()
+                # 原始训练流程
+                pred = model(batch)
+                optimizer.zero_grad()
+                ## ignore nan targets (unlabeled) when computing training loss.
+                is_labeled = batch.y == batch.y
+                if "classification" in task_type: 
+                    loss = cls_criterion(pred.to(torch.float32)[is_labeled], batch.y.to(torch.float32)[is_labeled])
+                else:
+                    loss = reg_criterion(pred.to(torch.float32)[is_labeled], batch.y.to(torch.float32)[is_labeled])
+                loss.backward()
+                optimizer.step()
 
 def eval(model, device, loader, evaluator):
     model.eval()
@@ -77,7 +95,9 @@ def calculate_mape(y_true, y_pred):
 
 def main():
     # Training settings
-    parser = argparse.ArgumentParser(description='PNA model')
+    parser = argparse.ArgumentParser(description='GNN model')
+    parser.add_argument('--gnn', type=str, default="pna",
+                        help='gnn model to use (default: pna)')
     parser.add_argument('--device', type=int, default=0,
                         help='which gpu to use if any (default: 0)')
     parser.add_argument('--drop_ratio', type=float, default=0.5,
@@ -100,10 +120,24 @@ def main():
                         help='full feature or simple feature')
     parser.add_argument('--filename', type=str, default="",
                         help='filename to output result (default: )')
+    parser.add_argument('--disable_amp', action='store_true',
+                        help='禁用自动混合精度训练加速')
+
     args = parser.parse_args()
 
     device = torch.device("cuda:" + str(args.device)) if torch.cuda.is_available() else torch.device("cpu")
 
+    # 默认开启混合精度训练，除非明确禁用
+    scaler = None
+    if not args.disable_amp and torch.cuda.is_available():
+        print("启用自动混合精度训练")
+        scaler = GradScaler()
+    else:
+        if args.disable_amp:
+            print("混合精度训练已禁用")
+        elif not torch.cuda.is_available():
+            print("无法使用混合精度训练：CUDA不可用")
+    
     ### automatic dataloading and splitting
     dataset = PygGraphPropPredDataset(name = args.dataset)
 
@@ -120,12 +154,26 @@ def main():
     ### automatic evaluator. takes dataset name as input
     evaluator = Evaluator(args.dataset)
 
-    train_dataset = dataset[split_idx["train"]]
-    train_loader = DataLoader(dataset[split_idx["train"]], batch_size=args.batch_size, shuffle=True, num_workers = args.num_workers)
-    valid_loader = DataLoader(dataset[split_idx["valid"]], batch_size=args.batch_size, shuffle=False, num_workers = args.num_workers)
+    # 使用pin_memory加速CPU到GPU的数据传输
+    pin_memory = torch.cuda.is_available()
+
+    # 自动设置最佳num_workers数量
+    if args.num_workers <= 0:
+        # 如果用户没有指定或指定为0，则自动设置为CPU核心数的一半（最少为2）
+        import multiprocessing
+        optimal_workers = max(2, multiprocessing.cpu_count() // 2)
+        print(f"自动设置num_workers={optimal_workers} (CPU核心数的一半)")
+        num_workers = optimal_workers
+    else:
+        num_workers = args.num_workers
+        print(f"使用指定的num_workers={num_workers}")
     
-    # 加载标准测试集
-    standard_test_loader = DataLoader(dataset[split_idx["test"]], batch_size=args.batch_size, shuffle=False, num_workers = args.num_workers)
+    train_loader = DataLoader(dataset[split_idx["train"]], batch_size=args.batch_size, 
+                             shuffle=True, num_workers=args.num_workers, pin_memory=pin_memory)
+    valid_loader = DataLoader(dataset[split_idx["valid"]], batch_size=args.batch_size, 
+                             shuffle=False, num_workers=args.num_workers, pin_memory=pin_memory)
+    standard_test_loader = DataLoader(dataset[split_idx["test"]], batch_size=args.batch_size, 
+                                     shuffle=False, num_workers=args.num_workers, pin_memory=pin_memory)
     
     # 加载外部测试集（如果提供, 那么覆盖标准测试集）
     external_test_loader = None
@@ -142,15 +190,30 @@ def main():
             print(f"Failed to load external test dataset: {e}")
             external_test_loader = None
 
-    # Compute in-degree histogram over training data.
-    deg = torch.zeros(80, dtype=torch.long)
-    for data in train_dataset:
-        d = degree(data.edge_index[1], num_nodes=data.num_nodes, dtype=torch.long)
-        deg += torch.bincount(d, minlength=deg.numel())
-
-    model = Net(deg=deg, num_tasks = dataset.num_tasks, num_layer = args.num_layer, emb_dim = args.emb_dim, drop_ratio = args.drop_ratio).to(device)
+    # 根据gnn选择模型
+    if args.gnn == "pna":
+        # Compute in-degree histogram over training data.
+        deg = torch.zeros(80, dtype=torch.long)
+        for data in dataset[split_idx["train"]]:
+            d = degree(data.edge_index[1], num_nodes=data.num_nodes, dtype=torch.long)
+            deg += torch.bincount(d, minlength=deg.numel())
+        from pna import Net
+        model = Net(deg=deg, num_tasks = dataset.num_tasks, num_layer = args.num_layer, emb_dim = args.emb_dim, drop_ratio = args.drop_ratio).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+    elif args.gnn == "rgcn":
+        from rgcn import Net
+        model = Net(num_tasks = dataset.num_tasks, num_layer = args.num_layer, emb_dim = args.emb_dim, drop_ratio = args.drop_ratio).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    elif args.gnn == "gat":
+        from gat import Net
+        head=8
+        model = Net(heads=head, num_tasks = dataset.num_tasks, num_layer = args.num_layer, emb_dim = args.emb_dim, drop_ratio = args.drop_ratio).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=0.0005)
+    elif args.gnn == "sage":
+        from sage import Net
+        model = Net(num_tasks = dataset.num_tasks, num_layer = args.num_layer, emb_dim = args.emb_dim, drop_ratio = args.drop_ratio).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=0.0005)
     
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=10,min_lr=0.00001)
 
     valid_curve = []
@@ -165,7 +228,7 @@ def main():
     for epoch in range(1, args.epochs + 1):
         print("=====Epoch {}".format(epoch))
         print('Training...')
-        train(model, device, train_loader, optimizer, dataset.task_type)
+        train(model, device, train_loader, optimizer, dataset.task_type, scaler)
 
         print('Evaluating...')
         train_perf, train_true, train_pred = eval(model, device, train_loader, evaluator)
@@ -209,7 +272,7 @@ def main():
 
         test_loss=test_perf[dataset.eval_metric]
         if test_loss<=np.min(np.array(test_curve)):
-            PATH='model/'+args.dataset + '_pna_layer_'+ str(args.num_layer)+'_model.pt'
+            PATH='model/'+args.dataset + f'_{args.gnn}_layer_'+ str(args.num_layer)+'_model.pt'
             os.makedirs(os.path.dirname(PATH), exist_ok=True)  # Ensure the directory exists
             torch.save({'epoch': epoch,
                         'model_state_dict': model.state_dict(),
@@ -273,7 +336,7 @@ def main():
 
     # 保存标准测试结果
     os.makedirs('result', exist_ok=True)
-    f = open('result/'+args.dataset + '_pna_layer_'+str(args.num_layer)+'.json', 'w')
+    f = open('result/'+args.dataset + f'_{args.gnn}_layer_'+str(args.num_layer)+'.json', 'w')
     result=dict(val=valid_curve[best_val_epoch], \
         test=test_curve[best_val_epoch],train=train_curve[best_val_epoch], \
         test_pred=test_predict_value, value_pred=valid_predict_value, 
