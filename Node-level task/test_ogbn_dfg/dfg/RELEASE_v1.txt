@@ -1,3 +1,0 @@
-# Release note for ogbn-dfg
-
-### v1: 2021-11-09
