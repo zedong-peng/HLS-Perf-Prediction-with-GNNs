@@ -33,6 +33,7 @@ class PygGraphPropPredDataset(InMemoryDataset):
             
             master = pd.read_csv(os.path.join(os.path.dirname(__file__), 'master.csv'), index_col = 0)
             if not self.name in master:
+                print(self.name)
                 error_mssg = 'Invalid dataset name {}.\n'.format(self.name)
                 error_mssg += 'Available datasets are as follows:\n'
                 error_mssg += '\n'.join(master.keys())

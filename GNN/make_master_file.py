@@ -13,7 +13,9 @@ names = ['dfg_cp','dfg_dsp','dfg_lut','dfg_ff',
     'cdfg_cp_binary','cdfg_dsp_binary','cdfg_lut_binary','cdfg_ff_binary',
     'cdfg_cp_numerical','cdfg_dsp_numerical','cdfg_lut_numerical','cdfg_ff_numerical', 
     'cdfg_cp_all_binary','cdfg_dsp_all_binary','cdfg_lut_all_binary','cdfg_ff_all_binary',
-    'cdfg_cp_all_numerical','cdfg_dsp_all_numerical','cdfg_lut_all_numerical','cdfg_ff_all_numerical']
+    'cdfg_cp_all_numerical','cdfg_dsp_all_numerical','cdfg_lut_all_numerical','cdfg_ff_all_numerical',
+    'cdfg_dsp_all_numerical_gnn_test','cdfg_lut_all_numerical_gnn_test','cdfg_ff_all_numerical_gnn_test'
+    ]
 
 for name in names:
     dataset_dict[name] = {'eval metric': 'rmse'}

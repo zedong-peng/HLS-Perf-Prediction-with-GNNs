@@ -71,6 +71,10 @@ The processed datasets are stored together with [GNN models](#modeling-and-advan
 * [Pytorch Geometric](https://github.com/pyg-team/pytorch_geometric) for graph-level regression tasks
 * [OGB](https://github.com/snap-stanford/ogb/tree/e84a2ab93172433c58740d4f7727997727bbb52e) for node-level classification tasks
 
+```
+pip install torch-geometric torch-scatter torch-sparse torch-cluster torch-spline-conv
+```
+
 <!-- Road Map -->
 ## Road Map
 <figure>

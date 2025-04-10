@@ -26,9 +26,14 @@ def train(model, device, loader, optimizer, task_type, scaler=None):
     model.train()
 
     for step, batch in enumerate(tqdm(loader, desc="Iteration")):
+        # 检查批次是否为空或无效
+        if not hasattr(batch, 'x') or not hasattr(batch, 'batch') or batch.x.shape[0] == 0 or batch.batch.shape[0] == 0:
+            print(f"警告：跳过空批次。批次 {step}")
+            continue
+            
         batch = batch.to(device)
 
-        if batch.x.shape[0] == 1 or batch.batch[-1] == 0:
+        if batch.x.shape[0] == 1 or (batch.batch.shape[0] > 0 and batch.batch[-1] == 0):
             pass
         else:
             # 使用混合精度训练
@@ -37,6 +42,12 @@ def train(model, device, loader, optimizer, task_type, scaler=None):
                     pred = model(batch)
                     ## ignore nan targets (unlabeled) when computing training loss.
                     is_labeled = batch.y == batch.y
+                    
+                    # 检查预测值和标签的形状是否匹配
+                    if pred.shape[0] != batch.y.shape[0]:
+                        print(f"警告：跳过形状不匹配的批次。预测形状: {pred.shape}, 标签形状: {batch.y.shape}")
+                        continue
+                        
                     if "classification" in task_type: 
                         loss = cls_criterion(pred.to(torch.float32)[is_labeled], batch.y.to(torch.float32)[is_labeled])
                     else:
@@ -52,6 +63,12 @@ def train(model, device, loader, optimizer, task_type, scaler=None):
                 optimizer.zero_grad()
                 ## ignore nan targets (unlabeled) when computing training loss.
                 is_labeled = batch.y == batch.y
+                
+                # 检查预测值和标签的形状是否匹配
+                if pred.shape[0] != batch.y.shape[0]:
+                    print(f"警告：跳过形状不匹配的批次。预测形状: {pred.shape}, 标签形状: {batch.y.shape}")
+                    continue
+                    
                 if "classification" in task_type: 
                     loss = cls_criterion(pred.to(torch.float32)[is_labeled], batch.y.to(torch.float32)[is_labeled])
                 else:
@@ -65,6 +82,11 @@ def eval(model, device, loader, evaluator):
     y_pred = []
 
     for step, batch in enumerate(tqdm(loader, desc="Iteration")):
+        # 检查批次是否为空或无效
+        if not hasattr(batch, 'x') or not hasattr(batch, 'batch') or batch.x.shape[0] == 0 or batch.batch.shape[0] == 0:
+            print(f"警告：评估时跳过空批次。批次 {step}")
+            continue
+            
         batch = batch.to(device)
 
         if batch.x.shape[0] == 1:
@@ -72,9 +94,19 @@ def eval(model, device, loader, evaluator):
         else:
             with torch.no_grad():
                 pred = model(batch)
+                
+            # 检查预测值和标签的形状是否匹配
+            if pred.shape[0] != batch.y.shape[0]:
+                print(f"警告：评估时跳过形状不匹配的批次。预测形状: {pred.shape}, 标签形状: {batch.y.shape}")
+                continue
 
             y_true.append(batch.y.view(pred.shape).detach().cpu())
             y_pred.append(pred.detach().cpu())
+
+    # 检查是否有收集到预测结果
+    if len(y_true) == 0 or len(y_pred) == 0:
+        print("警告：没有有效的预测结果。请检查数据集和模型。")
+        return {"rmse": float("inf")}, np.array([]), np.array([])
 
     y_true = torch.cat(y_true, dim = 0).numpy()
     y_pred = torch.cat(y_pred, dim = 0).numpy()
@@ -107,9 +139,11 @@ def main():
     parser.add_argument('--emb_dim', type=int, default=300,
                         help='dimensionality of hidden units in GNNs (default: 300)')
     parser.add_argument('--batch_size', type=int, default=32,
-                        help='input batch size for training (default: 32)')
-    parser.add_argument('--epochs', type=int, default=300,
-                        help='number of epochs to train (default: 300)')
+                        help='batch size for training and validation')
+    parser.add_argument('--lr', type=float, default=0.001,
+                        help='learning rate')
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='maximum number of epochs to train (default: 100)')
     parser.add_argument('--num_workers', type=int, default=0,
                         help='number of workers (default: 0)')
     parser.add_argument('--dataset', type=str, default="dfg_dsp_binary",
@@ -184,7 +218,7 @@ def main():
             if args.feature == 'simple':
                 external_dataset.data.x = external_dataset.data.x[:,:2]
                 external_dataset.data.edge_attr = external_dataset.data.edge_attr[:,:2]
-            external_test_loader = DataLoader(external_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+            external_test_loader = loader.DataLoader(external_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
             print(f"External test dataset loaded with {len(external_dataset)} samples")
         except Exception as e:
             print(f"Failed to load external test dataset: {e}")
@@ -193,26 +227,34 @@ def main():
     # 根据gnn选择模型
     if args.gnn == "pna":
         # Compute in-degree histogram over training data.
-        deg = torch.zeros(80, dtype=torch.long)
+        # 首先找到训练集中的最大节点度数
+        max_degree = 0
+        for data in dataset[split_idx["train"]]:
+            d = degree(data.edge_index[1], num_nodes=data.num_nodes, dtype=torch.long)
+            max_degree = max(max_degree, d.max().item())
+        
+        # 使用找到的最大度数加1来创建直方图向量
+        deg = torch.zeros(max_degree + 1, dtype=torch.long)
         for data in dataset[split_idx["train"]]:
             d = degree(data.edge_index[1], num_nodes=data.num_nodes, dtype=torch.long)
             deg += torch.bincount(d, minlength=deg.numel())
+        
         from pna import Net
         model = Net(deg=deg, num_tasks = dataset.num_tasks, num_layer = args.num_layer, emb_dim = args.emb_dim, drop_ratio = args.drop_ratio).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
     elif args.gnn == "rgcn":
         from rgcn import Net
         model = Net(num_tasks = dataset.num_tasks, num_layer = args.num_layer, emb_dim = args.emb_dim, drop_ratio = args.drop_ratio).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
     elif args.gnn == "gat":
         from gat import Net
         head=8
         model = Net(heads=head, num_tasks = dataset.num_tasks, num_layer = args.num_layer, emb_dim = args.emb_dim, drop_ratio = args.drop_ratio).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=0.0005)
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
     elif args.gnn == "sage":
         from sage import Net
         model = Net(num_tasks = dataset.num_tasks, num_layer = args.num_layer, emb_dim = args.emb_dim, drop_ratio = args.drop_ratio).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=0.0005)
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
     
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=10,min_lr=0.00001)
 
@@ -298,7 +340,16 @@ def main():
     if external_test_loader:
         print('Evaluating on external test set...')
         # 加载最佳模型
-        best_model = Net(deg=deg, num_tasks=dataset.num_tasks, num_layer=args.num_layer, emb_dim=args.emb_dim, drop_ratio=args.drop_ratio).to(device)
+        if args.gnn == "pna":
+            best_model = Net(deg=deg, num_tasks=dataset.num_tasks, num_layer=args.num_layer, emb_dim=args.emb_dim, drop_ratio=args.drop_ratio).to(device)
+        elif args.gnn == "rgcn":
+            best_model = Net(num_tasks=dataset.num_tasks, num_layer=args.num_layer, emb_dim=args.emb_dim, drop_ratio=args.drop_ratio).to(device)
+        elif args.gnn == "gat":
+            head=8
+            best_model = Net(heads=head, num_tasks=dataset.num_tasks, num_layer=args.num_layer, emb_dim=args.emb_dim, drop_ratio=args.drop_ratio).to(device)
+        elif args.gnn == "sage":
+            best_model = Net(num_tasks=dataset.num_tasks, num_layer=args.num_layer, emb_dim=args.emb_dim, drop_ratio=args.drop_ratio).to(device)
+            
         best_model.load_state_dict(torch.load(PATH)['model_state_dict'])
         
         external_perf, ext_true, ext_pred = eval(best_model, device, external_test_loader, evaluator)
