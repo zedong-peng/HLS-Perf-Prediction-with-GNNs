@@ -236,7 +236,7 @@ def main():
         print('Evaluating on external test set...')
         # 加载最佳模型
         best_model = Net(deg=deg, num_tasks=dataset.num_tasks, num_layer=args.num_layer, emb_dim=args.emb_dim, drop_ratio=args.drop_ratio).to(device)
-        best_model.load_state_dict(torch.load(PATH)['model_state_dict'])
+        best_model.load_state_dict(torch.load(PATH, weights_only=False)['model_state_dict'])
         
         external_perf, ext_true, ext_pred = eval(best_model, device, external_test_loader, evaluator)
         print('External test score: {}'.format(external_perf[dataset.eval_metric]))

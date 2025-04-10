@@ -1,4 +1,4 @@
-GNN/__pycache__/
+**/__pycache__/
 **/*.pt
 **/*.adb
 **/*.gz

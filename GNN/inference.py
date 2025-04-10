@@ -151,7 +151,7 @@ def main():
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=10,min_lr=0.00001)
 
     PATH='model/'+args.dataset + '_'+ args.gnn+ '_layer_'+ str(args.num_layer)+'_model.pt'
-    checkpoint = torch.load(PATH)
+    checkpoint = torch.load(PATH, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     epoch = checkpoint['epoch']

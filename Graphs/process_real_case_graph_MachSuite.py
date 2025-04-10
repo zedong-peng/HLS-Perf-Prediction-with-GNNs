@@ -19,8 +19,13 @@ import multiprocessing
 
 # %%
 dataset_name = 'gnn_test'
-data_of_designs_json_path = '/home/user/zedongpeng/workspace/HLSBatchProcessor/src/csv/data_of_designs_gnn_test.json'
-designs_dir = f'/home/user/zedongpeng/workspace/HLSBatchProcessor/data/designs/gnn_test'
+designs_dir = f'/home/user/zedongpeng/workspace/HLSBatchProcessor/data/designs/{dataset_name}'
+
+# call dataset_csv.py to dataset_csv
+from dataset_csv import dataset_csv
+dataset_csv(designs_dir, "./csv")
+
+data_of_designs_json_path = f'./csv/data_of_designs_{dataset_name}.json'
 
 # 如果./real_case/dataset_name ./real_case/dataset_name_adb ./real_case/dataset_name _ds folder存在 那么删除后重建
 
@@ -344,7 +349,7 @@ def process_c_files_to_adb(designs_dir, c_files):
     
     # 计算最佳工作进程数
     cpu_count = multiprocessing.cpu_count()
-    workers = min(cpu_count * 2, 64)  # 使用更多的工作线程
+    workers = min(cpu_count * 8, 256)  # 使用更多的工作线程
     
     # 创建进度条
     pbar = tqdm.tqdm(total=len(c_files), desc="处理文件")
@@ -399,10 +404,8 @@ for key, designs in design_count.items():
 print(f"总计: {total_designs}个设计\n")
 
 # 批量处理以提高效率，增加批次大小
-batch_size = 2000  # 增加批次大小
+batch_size = 5000  # 增加批次大小
 total_batches = (len(c_files) + batch_size - 1) // batch_size
-
-# 预先创建所有可能的目标目录 如果存在 那么覆盖
 
 source_names = set()
 for c_file in c_files:
