@@ -22,13 +22,7 @@ def gather_csynth_data(root_dir, output_csv):
         for file in files:
             if file == 'csynth.xml':
                 file_path = os.path.join(root, file)
-                rpt_file_path = os.path.join(root, 'csynth.rpt')
-                
-                # 检查是否存在 csynth.rpt 文件
-                if os.path.exists(rpt_file_path):
-                    csynth_files.append(file_path)
-                else:
-                    print(f"[INFO] 缺少 csynth.rpt 文件，跳过: {file_path}")
+                csynth_files.append(file_path)
     
     # 并行处理文件
     results = []

@@ -443,14 +443,14 @@ def main():
                 
                 # 将外部测试结果添加到最终结果中
                 os.makedirs('result', exist_ok=True)
-                ext_result_file = 'result/'+args.dataset+'_external_test_pna_layer_'+str(args.num_layer)+'.json'
+                ext_result_file = 'result/'+args.dataset+'_external_test_pna_layer_'+str(args.num_layer)+'_training.json'
                 with open(ext_result_file, 'w') as f:
                     json.dump(external_result, f, indent=4)
                 print(f'External test results saved to {ext_result_file}')
 
             # 保存标准测试结果
             os.makedirs('result', exist_ok=True)
-            f = open('result/'+args.dataset + f'_{args.gnn}_layer_'+str(args.num_layer)+'.json', 'w')
+            f = open('result/'+args.dataset + f'_{args.gnn}_layer_'+str(args.num_layer)+'_training.json', 'w')
             
             # 优化JSON结果，只保存必要信息
             result = {

@@ -5,5 +5,5 @@
 **/*.csv
 **/*.json
 **/.DS_Store
-visulization/
-'Node-level task/'
+
+!GNN/master.csv

@@ -16,7 +16,8 @@ names = ['dfg_cp','dfg_dsp','dfg_lut','dfg_ff',
     'cdfg_cp_all_numerical','cdfg_dsp_all_numerical','cdfg_lut_all_numerical','cdfg_ff_all_numerical',
     'cdfg_dsp_all_numerical_gnn_test','cdfg_lut_all_numerical_gnn_test','cdfg_ff_all_numerical_gnn_test',
     'cdfg_dsp_all_numerical_PolyBench','cdfg_lut_all_numerical_PolyBench','cdfg_ff_all_numerical_PolyBench',
-    'cdfg_dsp_all_numerical_forgehls','cdfg_lut_all_numerical_forgehls','cdfg_ff_all_numerical_forgehls'
+    'cdfg_dsp_all_numerical_forgehls','cdfg_lut_all_numerical_forgehls','cdfg_ff_all_numerical_forgehls',
+    'cdfg_dsp_all_numerical_test_bench','cdfg_lut_all_numerical_test_bench','cdfg_ff_all_numerical_test_bench'
     ]
 
 for name in names:

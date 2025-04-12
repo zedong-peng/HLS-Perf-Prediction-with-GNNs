@@ -13,6 +13,7 @@ import numpy as np
 import json
 import operator
 from functools import reduce
+import os
 
 import ARMA
 import film
@@ -60,6 +61,11 @@ def eval(model, device, loader, evaluator):
     y_pred = []
 
     for step, batch in enumerate(tqdm(loader, desc="Iteration")):
+        # 检查批次是否为空或无效
+        if not hasattr(batch, 'x') or not hasattr(batch, 'batch') or batch.x.shape[0] == 0 or batch.batch.shape[0] == 0:
+            print(f"警告：评估时跳过空批次。批次 {step}")
+            continue
+            
         batch = batch.to(device)
 
         if batch.x.shape[0] == 1:
@@ -67,9 +73,19 @@ def eval(model, device, loader, evaluator):
         else:
             with torch.no_grad():
                 pred = model(batch)
+                
+            # 检查预测值和标签的形状是否匹配
+            if pred.shape[0] != batch.y.shape[0]:
+                print(f"警告：评估时跳过形状不匹配的批次。预测形状: {pred.shape}, 标签形状: {batch.y.shape}")
+                continue
 
             y_true.append(batch.y.view(pred.shape).detach().cpu())
             y_pred.append(pred.detach().cpu())
+
+    # 检查是否有收集到预测结果
+    if len(y_true) == 0 or len(y_pred) == 0:
+        print("警告：没有有效的预测结果。请检查数据集和模型。")
+        return {"rmse": float("inf")}, np.array([]), np.array([])
 
     y_true = torch.cat(y_true, dim = 0).numpy()
     y_pred = torch.cat(y_pred, dim = 0).numpy()
@@ -78,6 +94,37 @@ def eval(model, device, loader, evaluator):
 
     return evaluator.eval(input_dict), y_true, y_pred
 
+# 添加MAPE计算函数
+def calculate_mape(y_true, y_pred):
+    """
+    计算平均绝对百分比误差 (MAPE)
+    """
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    # 避免除以零
+    mask = y_true != 0
+    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+
+# 添加RMSE计算函数
+def calculate_rmse(y_true, y_pred):
+    """
+    计算均方根误差 (RMSE)
+    """
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    return np.sqrt(np.mean((y_true - y_pred) ** 2))
+
+def monitor_memory(threshold_gb=70):
+    """监控GPU内存，在接近阈值时采取行动"""
+    if torch.cuda.is_available():
+        current_memory = torch.cuda.memory_allocated() / (1024**3)
+        total_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        
+        if current_memory > threshold_gb:
+            print(f"警告: GPU内存使用达到{current_memory:.2f}GB，接近限制！")
+            # 主动释放可能不必要的缓存
+            torch.cuda.empty_cache()
+            # 如果仍然接近阈值，中断当前批次
+            if torch.cuda.memory_allocated() / (1024**3) > threshold_gb:
+                raise MemoryError("GPU内存不足，主动中断以防止OOM")
 
 def main():
     # Training settings
@@ -96,6 +143,8 @@ def main():
                         help='input batch size for training (default: 32)')
     parser.add_argument('--dataset', type=str, default="ogbg-molhiv",
                         help='dataset name (default: ogbg-molhiv)')
+    parser.add_argument('--model_path', type=str, default=None,
+                        help='path to the .pt model file (default: None, will use auto-generated path)')
     args = parser.parse_args()
 
     device = torch.device("cuda:" + str(args.device)) if torch.cuda.is_available() else torch.device("cpu")
@@ -150,7 +199,12 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=0.0005)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=10,min_lr=0.00001)
 
-    PATH='model/'+args.dataset + '_'+ args.gnn+ '_layer_'+ str(args.num_layer)+'_model.pt'
+    # 使用指定的模型路径或默认路径
+    if args.model_path is not None:
+        PATH = args.model_path
+    else:
+        PATH = 'model/'+args.dataset + '_'+ args.gnn+ '_layer_'+ str(args.num_layer)+'_model.pt'
+    
     checkpoint = torch.load(PATH, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -159,13 +213,54 @@ def main():
 
     test_perf, t_true, t_pred = eval(model, device, test_loader, evaluator)
     
-    test_true_value=reduce(operator.add, t_true.tolist())
-    test_pred_value=reduce(operator.add, t_pred.tolist())
+    test_true_value = reduce(operator.add, t_true.tolist())
+    test_pred_value = reduce(operator.add, t_pred.tolist())
 
-    f = open('inf_'+args.dataset + '_'+ args.gnn+ '_layer_'+ str(args.num_layer)+ '.json', 'w')
-    result=dict(test_true=test_true_value, test_pred=test_pred_value)
-    json.dump(result, f)
+    # 计算MAPE和RMSE
+    mape = calculate_mape(test_true_value, test_pred_value)
+    rmse = calculate_rmse(test_true_value, test_pred_value)
+    
+    # 计算误差统计信息
+    errors = [abs(pred - true) for pred, true in zip(test_pred_value, test_true_value)]
+    error_stats = {
+        'min': float(min(errors)),
+        'max': float(max(errors)),
+        'mean': float(sum(errors) / len(errors)),
+        'median': float(sorted(errors)[len(errors)//2]),
+        'percentile_90': float(sorted(errors)[int(len(errors)*0.9)])
+    }
+    
+    # 确保结果目录存在
+    os.makedirs('./result', exist_ok=True)
+    
+    # 保存结果，格式与main.py类似
+    result = {
+        'metrics': {
+            'test': float(test_perf[dataset.eval_metric]),
+            'test_mape': float(mape),
+            'test_rmse': float(rmse)
+        },
+        'error_stats': error_stats,
+        'test_true': test_true_value,
+        'test_pred': test_pred_value,
+        'model_info': {
+            'gnn_type': args.gnn,
+            'num_layer': args.num_layer,
+            'emb_dim': args.emb_dim,
+            'drop_ratio': args.drop_ratio
+        },
+        'dataset_info': {
+            'name': args.dataset,
+            'num_samples': len(dataset[split_idx["test"]])
+        }
+    }
+    
+    # 使用indent参数使JSON格式化输出，更易读
+    f = open('./result/'+args.dataset + '_'+ args.gnn+ '_layer_'+ str(args.num_layer)+ '_inference.json', 'w')
+    json.dump(result, f, indent=4)
     f.close()
+    
+    print(f"推理完成。测试集RMSE: {rmse:.4f}, MAPE: {mape:.2f}%")
 
 
 if __name__ == "__main__":

@@ -70,11 +70,45 @@ class PygGraphPropPredDataset(InMemoryDataset):
         if os.path.isfile(os.path.join(path, 'split_dict.pt')):
             return torch.load(os.path.join(path, 'split_dict.pt'), weights_only=False)
 
-        train_idx = pd.read_csv(osp.join(path, 'train.csv.gz'), compression='gzip', header = None).values.T[0]
-        valid_idx = pd.read_csv(osp.join(path, 'valid.csv.gz'), compression='gzip', header = None).values.T[0]
-        test_idx = pd.read_csv(osp.join(path, 'test.csv.gz'), compression='gzip', header = None).values.T[0]
+        split_dict = {}
+        
+        # 检查训练集文件是否存在
+        train_path = osp.join(path, 'train.csv.gz')
+        if os.path.exists(train_path):
+            try:
+                train_idx = pd.read_csv(train_path, compression='gzip', header = None).values.T[0]
+                split_dict['train'] = torch.tensor(train_idx, dtype = torch.long)
+            except Exception as e:
+                print(f"警告：读取训练集索引时出错: {e}")
+                split_dict['train'] = torch.tensor([], dtype = torch.long)
+        else:
+            split_dict['train'] = torch.tensor([], dtype = torch.long)
+        
+        # 检查验证集文件是否存在
+        valid_path = osp.join(path, 'valid.csv.gz')
+        if os.path.exists(valid_path):
+            try:
+                valid_idx = pd.read_csv(valid_path, compression='gzip', header = None).values.T[0]
+                split_dict['valid'] = torch.tensor(valid_idx, dtype = torch.long)
+            except Exception as e:
+                print(f"警告：读取验证集索引时出错: {e}")
+                split_dict['valid'] = torch.tensor([], dtype = torch.long)
+        else:
+            split_dict['valid'] = torch.tensor([], dtype = torch.long)
+        
+        # 检查测试集文件是否存在
+        test_path = osp.join(path, 'test.csv.gz')
+        if os.path.exists(test_path):
+            try:
+                test_idx = pd.read_csv(test_path, compression='gzip', header = None).values.T[0]
+                split_dict['test'] = torch.tensor(test_idx, dtype = torch.long)
+            except Exception as e:
+                print(f"警告：读取测试集索引时出错: {e}")
+                split_dict['test'] = torch.tensor([], dtype = torch.long)
+        else:
+            split_dict['test'] = torch.tensor([], dtype = torch.long)
 
-        return {'train': torch.tensor(train_idx, dtype = torch.long), 'valid': torch.tensor(valid_idx, dtype = torch.long), 'test': torch.tensor(test_idx, dtype = torch.long)}
+        return split_dict
 
     @property
     def num_classes(self):

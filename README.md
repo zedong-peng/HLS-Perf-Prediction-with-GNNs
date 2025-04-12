@@ -72,7 +72,7 @@ The processed datasets are stored together with [GNN models](#modeling-and-advan
 * [OGB](https://github.com/snap-stanford/ogb/tree/e84a2ab93172433c58740d4f7727997727bbb52e) for node-level classification tasks
 
 ```
-pip install torch-geometric scikit-learn
+pip install torch-geometric torch-scatter scikit-learn
 ```
 
 <!-- Road Map -->
