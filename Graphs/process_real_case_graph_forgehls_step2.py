@@ -78,7 +78,7 @@ edge_feat = edge_feat_1
 # %%
 ### save merged dataset
 
-save_dir = f'real_case/dataset_csv_{dataset_name}/'
+save_dir = f'real_case/dataset_ready_for_GNN_csv/{dataset_name}/'
 if os.path.exists(save_dir):
     shutil.rmtree(save_dir)
 os.makedirs(save_dir, exist_ok=True)
