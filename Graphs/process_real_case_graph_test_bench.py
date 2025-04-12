@@ -945,7 +945,7 @@ import multiprocessing
 
 # 创建数据集目录结构并压缩文件
 def create_dataset_structure(metric, dataset_name):
-    dataset_dir = f"../GNN/dataset/cdfg_{metric}_all_numerical_{dataset_name}/"
+    dataset_dir = f"./dataset/cdfg_{metric}_all_numerical_{dataset_name}/"
 
     os.makedirs(f"{dataset_dir}mapping", exist_ok=False)
     os.makedirs(f"{dataset_dir}split/scaffold", exist_ok=False)
@@ -993,9 +993,9 @@ def create_dataset_structure(metric, dataset_name):
 
 # 使用进程池并行创建三个指标的数据集
 metrics = ["lut", "ff", "dsp"]
-# dataset_dir = f"../GNN/dataset/cdfg_{metric}_all_numerical_{dataset_name}/"
+
 for metric in metrics:
-    dataset_dir = f"../GNN/dataset/cdfg_{metric}_all_numerical_{dataset_name}/"
+    dataset_dir = f"./dataset/cdfg_{metric}_all_numerical_{dataset_name}/"
     if os.path.exists(dataset_dir):
         shutil.rmtree(dataset_dir)
 
