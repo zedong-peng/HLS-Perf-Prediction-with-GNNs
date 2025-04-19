@@ -270,7 +270,15 @@ def main():
         model = Net(num_tasks = dataset.num_tasks, num_layer = args.num_layer, emb_dim = args.emb_dim, drop_ratio = args.drop_ratio).to(device)
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5,min_lr=0.00001)
+    # 改进的学习率调度器 - 更灵活的配置
+    scheduler = ReduceLROnPlateau(
+        optimizer, 
+        mode='min', 
+        factor=0.5, 
+        patience=10,
+        min_lr=0.0001,
+        verbose=True  # 添加verbose参数以打印学习率变化
+    )
 
     valid_curve = []
     test_curve = []
@@ -284,6 +292,11 @@ def main():
     for epoch in range(1, args.epochs + 1):
         print("=====Epoch {}".format(epoch))
         print('Training...')
+        
+        # 打印当前学习率
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f'Current learning rate: {current_lr}')
+        
         try:
             for batch_idx, batch in enumerate(train_loader):
                 # 每100个批次检查一次内存(基本上不检查)
@@ -498,6 +511,9 @@ def main():
 
             if not args.filename == '':
                 torch.save({'Val': valid_curve[best_val_epoch], 'Test': test_curve[best_val_epoch], 'Train': train_curve[best_val_epoch], 'BestTrain': best_train}, args.filename)
+
+            # 在验证后更新学习率调度器
+            scheduler.step(valid_perf[dataset.eval_metric])
 
         except MemoryError as e:
             print(f"检测到内存压力，正在安全保存模型并调整参数...")
