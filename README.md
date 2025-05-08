@@ -11,6 +11,7 @@ mv dataset ../GNN/dataset/
 generate model:
 ```
 cd GNN
+python make_master_file.py
 bash train_on_PolyBench.sh
 ```
 
@@ -19,12 +20,6 @@ test model on test_bench:
 cd GNN
 bash inference_on_PolyBench.sh
 ```
-
-
-
-
-
-
 
 <!-- Prerequisites -->
 ## Prerequisites
