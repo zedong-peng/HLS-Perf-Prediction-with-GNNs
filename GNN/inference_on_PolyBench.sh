@@ -15,6 +15,3 @@ python inference.py --gnn sage --batch_size=4 --emb_dim 128 --dataset cdfg_lut_a
 python inference.py --gnn gat --batch_size=4 --emb_dim 128 --dataset cdfg_dsp_all_numerical_test_bench --model_path model/cdfg_dsp_all_numerical_PolyBench_gat_layer_5_model.pt --device 6 &
 python inference.py --gnn gat --batch_size=4 --emb_dim 128 --dataset cdfg_ff_all_numerical_test_bench --model_path model/cdfg_ff_all_numerical_PolyBench_gat_layer_5_model.pt --device 7
 python inference.py --gnn gat --batch_size=4 --emb_dim 128 --dataset cdfg_lut_all_numerical_test_bench --model_path model/cdfg_lut_all_numerical_PolyBench_gat_layer_5_model.pt --device 7
-
-
-

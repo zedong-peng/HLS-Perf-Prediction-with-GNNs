@@ -145,6 +145,8 @@ def main():
                         help='dataset name (default: ogbg-molhiv)')
     parser.add_argument('--model_path', type=str, default=None,
                         help='path to the .pt model file (default: None, will use auto-generated path)')
+    parser.add_argument('--output_dir', type=str, default='./result',
+                        help='directory to save inference results (default: ./result)')
     args = parser.parse_args()
 
     device = torch.device("cuda:" + str(args.device)) if torch.cuda.is_available() else torch.device("cpu")
@@ -199,13 +201,8 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=0.0005)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=10,min_lr=0.00001)
 
-    # 使用指定的模型路径或默认路径
-    if args.model_path is not None:
-        PATH = args.model_path
-    else:
-        PATH = 'model/'+args.dataset + '_'+ args.gnn+ '_layer_'+ str(args.num_layer)+'_model.pt'
     
-    checkpoint = torch.load(PATH, weights_only=False)
+    checkpoint = torch.load(args.model_path, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     epoch = checkpoint['epoch']
@@ -231,9 +228,9 @@ def main():
     }
     
     # 确保结果目录存在
-    os.makedirs('./result', exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    # 保存结果，格式与main.py类似
+    # 保存结果
     result = {
         'metrics': {
             'test': float(test_perf[dataset.eval_metric]),
@@ -241,9 +238,8 @@ def main():
             'test_rmse': float(rmse)
         },
         'error_stats': error_stats,
-        'test_true': test_true_value,
-        'test_pred': test_pred_value,
         'model_info': {
+            'model_path': args.model_path,
             'gnn_type': args.gnn,
             'num_layer': args.num_layer,
             'emb_dim': args.emb_dim,
@@ -252,15 +248,20 @@ def main():
         'dataset_info': {
             'name': args.dataset,
             'num_samples': len(dataset[split_idx["test"]])
-        }
+        },
+        'test_true': test_true_value,
+        'test_pred': test_pred_value
     }
     
+    # 使用传入的output_dir参数构建输出文件路径
+    output_file = os.path.join(args.output_dir, f'inference_results.json')
+    
     # 使用indent参数使JSON格式化输出，更易读
-    f = open('./result/'+args.dataset + '_'+ args.gnn+ '_layer_'+ str(args.num_layer)+ '_inference.json', 'w')
-    json.dump(result, f, indent=4)
-    f.close()
+    with open(output_file, 'w') as f:
+        json.dump(result, f, indent=4)
     
     print(f"推理完成。测试集RMSE: {rmse:.4f}, MAPE: {mape:.2f}%")
+    print(f"结果已保存到: {output_file}")
 
 
 if __name__ == "__main__":

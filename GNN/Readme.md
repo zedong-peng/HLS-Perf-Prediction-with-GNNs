@@ -24,5 +24,16 @@
     ```
 * How to run:
   ```sh 
-  python main_pna.py --dataset dfg_dsp
+  python src/check_dataset_valid.py --dataset_name cdfg_ff_all_numerical_gnn_test --max_samples 10000
+  vim src/make_master_file.py
+  # edit make_master_file.py. add dataset name.
+  python src/make_master_file.py
+  bash train.sh
   ```
+
+  ### 
+  for various training in forgehls, we do:
+  1. fileter extremly large graph: nodes>5000, edges>10000
+  2. when training PNA model, needs empty_cache() for each epochs.
+    No empty_cache: batch_size=4,  80GB GPU memory still OOM.
+    with empty_cache: batch_size=32, ~24GB GPU memory.

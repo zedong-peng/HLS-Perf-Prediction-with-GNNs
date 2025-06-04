@@ -19,61 +19,59 @@ import multiprocessing
 # 添加dataset_name变量定义
 dataset_name = "forgehls"
 
+
 # %% [markdown]
 # The following is to merge real-case benchmarks with synthetic cdfg.
 
 # %%
 ### merge all real case
-# 自动检测所有real_case目录下的数据集
-case_dir_pattern = 'real_case/*_ds/'
-case_dir_all = glob.glob(case_dir_pattern)
+# 
+forgehls_dataset_names = ['PolyBench', 'CHStone', 'MachSuite', "rosetta", 
+                          "rtl_module", "rtl_ip", "rtl_chip", 
+                          "Vitis-HLS-Introductory-Examples-flatten", 
+                          "operators", "leetcode_hls_algorithms", "hls_algorithms"]
 
-print(f"检测到以下数据集目录:")
+case_dir_all = []
+for dataset_name in forgehls_dataset_names:
+    ds_dir = f'real_case/{dataset_name}_ds/'
+    if os.path.exists(ds_dir):
+        case_dir_all.append(dataset_name)
+        print(f"找到数据集: {dataset_name}")
+    else:
+        print(f"数据集目录不存在: {ds_dir}")
+
+print(f"\n总共找到 {len(case_dir_all)} 个可用数据集:")
 for dir_path in case_dir_all:
     print(f" - {dir_path}")
 
 if not case_dir_all:
-    print(f"警告: 未找到匹配 '{case_dir_pattern}' 的目录")
+    print(f"警告: 未找到匹配的目录")
 
-mapping_1 = []
-edge_feat_1 = []
-edge_1 = []
-node_1 = []
+graph_mapping_list = []
+edge_feat = []
+edge_list = []
+node_feat = []
 
-dsp_1 = []
-lut_1 = []
-ff_1 = []
-cp_1 = []
+DSP = []
+LUT = []
+FF = []
 
-node_num_1 = []
-edge_num_1 = []
+num_node_list = []
+num_edge_list = []
 
 
 for case_dir in case_dir_all:
-    mapping_1 += pd.read_csv(case_dir + 'mapping.csv').values.tolist()
-    edge_feat_1 += pd.read_csv(case_dir + 'edge-feat.csv', header = None).values.tolist()
-    edge_1 += pd.read_csv(case_dir + 'edge.csv', header = None).values.tolist()
-    node_1 += pd.read_csv(case_dir + 'node-feat.csv', header = None).values.tolist()
+    graph_mapping_list += pd.read_csv(case_dir + 'mapping.csv').values.tolist()
+    edge_feat += pd.read_csv(case_dir + 'edge-feat.csv', header = None).values.tolist()
+    edge_list += pd.read_csv(case_dir + 'edge.csv', header = None).values.tolist()
+    node_feat += pd.read_csv(case_dir + 'node-feat.csv', header = None).values.tolist()
 
-    dsp_1 += pd.read_csv(case_dir + 'graph-label-dsp.csv', header = None).values.tolist()
-    lut_1 += pd.read_csv(case_dir + 'graph-label-lut.csv', header = None).values.tolist()
-    ff_1 += pd.read_csv(case_dir + 'graph-label-ff.csv', header = None).values.tolist()
+    DSP += pd.read_csv(case_dir + 'graph-label-dsp.csv', header = None).values.tolist()
+    LUT += pd.read_csv(case_dir + 'graph-label-lut.csv', header = None).values.tolist()
+    FF += pd.read_csv(case_dir + 'graph-label-ff.csv', header = None).values.tolist()
 
-    node_num_1 += pd.read_csv(case_dir + 'num-node-list.csv', header = None).values.tolist()
-    edge_num_1 += pd.read_csv(case_dir + 'num-edge-list.csv', header = None).values.tolist()
-
-# merge together
-DSP = dsp_1
-LUT = lut_1
-FF = ff_1
-
-graph_mapping_list = mapping_1
-num_node_list = node_num_1
-num_edge_list = edge_num_1
-
-node_feat = node_1
-edge_list = edge_1
-edge_feat = edge_feat_1
+    num_node_list += pd.read_csv(case_dir + 'num-node-list.csv', header = None).values.tolist()
+    num_edge_list += pd.read_csv(case_dir + 'num-edge-list.csv', header = None).values.tolist()
 
 # %%
 ### save merged dataset

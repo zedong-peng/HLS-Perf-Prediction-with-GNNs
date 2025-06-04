@@ -19,11 +19,14 @@ import multiprocessing
 
 # %%
 
-dataset_names = ['PolyBench', 'CHStone', 'MachSuite', "rosetta", "rtl_module", "rtl_ip", "rtl_chip", "Vitis-HLS-Introductory-Examples-flatten", "operators", "leetcode_hls_algorithms", "hls_algorithms"]
+forgehls_dataset_names = ['PolyBench', 'CHStone', 'MachSuite', "rosetta", 
+                          "rtl_module", "rtl_ip", "rtl_chip", 
+                          "Vitis-HLS-Introductory-Examples-flatten", 
+                          "operators", "leetcode_hls_algorithms", "hls_algorithms"]
 designs_base_dir = '/home/user/zedongpeng/workspace/HLSBatchProcessor/data/designs'
 
 # 对每个数据集进行处理
-for dataset_name in dataset_names:
+for dataset_name in forgehls_dataset_names:
     print(f"\n\n========== 开始处理数据集: {dataset_name} ==========\n")
     designs_dir = f'{designs_base_dir}/{dataset_name}'
 
