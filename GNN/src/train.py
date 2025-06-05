@@ -1,7 +1,6 @@
 import torch
 from torch_geometric.data import DataLoader
 import torch.optim as optim
-import torch.nn.functional as F
 from torch_geometric.utils import degree
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import torch_geometric.transforms as T
@@ -20,8 +19,6 @@ import matplotlib.pyplot as plt
 
 from dataset_pyg import PygGraphPropPredDataset
 from evaluate import Evaluator
-
-import argparse
 
 cls_criterion = torch.nn.BCEWithLogitsLoss()
 reg_criterion = torch.nn.MSELoss()
@@ -46,16 +43,18 @@ def train_batch(model, batch, optimizer, task_type, scaler=None):
     else:
         raise ValueError(f"Unsupported task type: {task_type}")
     
+    # Store loss value before clearing variables
+    loss_value = loss.item()
+    
     # Backpropagation
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
     
-    # Clear intermediate variables to save memory
-    del pred, target, is_labeled
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    # 只清理中间变量，不清理CUDA缓存（会影响训练速度）
+    del pred, target, is_labeled, loss
     
-    return loss.item()
+    return loss_value
 
 def eval_batch(model, batch, evaluator, y_true, y_pred):
     """
@@ -67,22 +66,20 @@ def eval_batch(model, batch, evaluator, y_true, y_pred):
         return
     y_true.append(batch.y.view(pred.shape).detach().cpu())
     y_pred.append(pred.detach().cpu())
+    
+    # 只清理预测结果，保留列表引用
+    del pred
 
 def train(model, device, loader, optimizer, task_type, scaler=None):
     model.train()
     total_loss = 0
     batch_count = 0
-    loss_log_interval = 10  # Log average loss every N batches
+    loss_log_interval = 100  # 增加间隔减少打印频率
     
     for step, batch in enumerate(tqdm(loader, desc="Training")):
         if not hasattr(batch, 'x') or not hasattr(batch, 'batch') or batch.x.shape[0] == 0 or batch.batch.shape[0] == 0:
             print(f"Warning: Skipping empty batch. Batch {step}")
             continue
-        
-        # # Memory optimization: Skip extremely large batches
-        # if hasattr(batch, 'num_nodes') and batch.num_nodes > 3000:
-        #     print(f"Warning: Skipping large batch with {batch.num_nodes} nodes to prevent OOM")
-        #     continue
             
         batch = batch.to(device)
         if batch.x.shape[0] == 1 or (batch.batch.shape[0] > 0 and batch.batch[-1] == 0):
@@ -97,6 +94,10 @@ def train(model, device, loader, optimizer, task_type, scaler=None):
                 if (step + 1) % loss_log_interval == 0:
                     avg_loss = total_loss / batch_count
                     print(f"Batch {step+1}/{len(loader)}, Average Loss: {avg_loss:.6f}")
+                    
+                    # 只在需要时清理GPU缓存（每100个batch一次）
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
     
     # Output overall training loss
     if batch_count > 0:
@@ -114,30 +115,16 @@ def eval(model, device, loader, evaluator):
             print(f"Warning: Skipping empty batch during evaluation. Batch {step}")
             continue
         
-        # # Memory optimization: Skip extremely large batches during evaluation too
-        # if hasattr(batch, 'num_nodes') and batch.num_nodes > 3000:
-        #     print(f"Warning: Skipping large evaluation batch with {batch.num_nodes} nodes")
-        #     continue
-            
         batch = batch.to(device)
         if batch.x.shape[0] == 1:
             pass
         else:
-            try:
-                with torch.no_grad():
-                    eval_batch(model, batch, evaluator, y_true, y_pred)
-            except RuntimeError as e:
-                if "out of memory" in str(e):
-                    print(f"Warning: OOM during evaluation at batch {step}, skipping")
-                    torch.cuda.empty_cache()
-                    continue
-                else:
-                    raise e
-            finally:
-                # Clean up batch from GPU memory
-                del batch
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                
+            with torch.no_grad():
+                eval_batch(model, batch, evaluator, y_true, y_pred)
+            if step % 100 == 0:
+                print(f"Processed {step+1}/{len(loader)} batches in evaluation")
+
+
     if len(y_true) == 0 or len(y_pred) == 0:
         print("Warning: No valid prediction results. Please check dataset and model.")
         return {"rmse": float("inf")}, np.array([]), np.array([])
@@ -323,7 +310,7 @@ def save_training_info(args, output_dir, start_time, end_time, best_epoch, best_
         f.write("```bash\n")
         
         # Create command with all current argument values
-        cmd_parts = ["python src/main.py"]
+        cmd_parts = ["python src/train.py"]
         
         for arg, value in vars(args).items():
             if arg != 'output_dir':  # Don't include output_dir in reproduction command
@@ -490,20 +477,22 @@ def main():
     valid_curve = []
     test_curve = []
     train_curve = []
-    test_predict_value = []
-    test_true_value = []
-    valid_predict_value = []
-    valid_true_value = []
 
     # Add training loss curve record
     train_loss_curve = []
     # Add learning rate tracking
     learning_rate_curve = []
+    # Add MAPE curve tracking for regression tasks
+    mape_curve = []
+
+    # Initialize variables to store final results (computed once, not every epoch)
+    final_test_true = None
+    final_valid_true = None
 
     for epoch in range(1, args.epochs + 1):
         print(f"===== Epoch {epoch}/{args.epochs} =====")
         
-        # Clear GPU cache before each epoch
+        # 只在epoch开始时清理一次GPU缓存
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
@@ -538,6 +527,9 @@ def main():
             test_pred_list = reduce(operator.add, t_pred.tolist())
             test_mape = calculate_mape(test_true_list, test_pred_list)
             test_perf['mape'] = test_mape
+            
+            # Record MAPE for curve plotting
+            mape_curve.append(test_mape)
 
             print({'Train': {'rmse': train_perf[dataset.eval_metric], 'mape': f'{train_mape:.2f}%'},
                     'Validation': {'rmse': valid_perf[dataset.eval_metric], 'mape': f'{valid_mape:.2f}%'},
@@ -549,30 +541,48 @@ def main():
         valid_curve.append(valid_perf[dataset.eval_metric])
         test_curve.append(test_perf[dataset.eval_metric])
 
-        test_predict_value.append(reduce(operator.add, t_pred.tolist()))
-        valid_predict_value.append(reduce(operator.add, v_pred.tolist()))
-
-        test_loss = test_perf[dataset.eval_metric]
-        if test_loss <= np.min(np.array(test_curve)):
-            # Save best model to output directory
+        # Store true values only once (they don't change across epochs)
+        if final_test_true is None:
+            final_test_true = reduce(operator.add, t_true.tolist())
+            final_valid_true = reduce(operator.add, v_true.tolist())
+        
+        current_test_pred = reduce(operator.add, t_pred.tolist())
+        current_valid_pred = reduce(operator.add, v_pred.tolist())
+        
+        # Check if this is the best epoch based on validation performance
+        if 'classification' in dataset.task_type:
+            is_best = valid_perf[dataset.eval_metric] >= max(valid_curve)
+        else:
+            is_best = valid_perf[dataset.eval_metric] <= min(valid_curve)
+            
+        if is_best:
+            # Save best epoch predictions
+            best_test_pred = current_test_pred.copy()
+            best_valid_pred = current_valid_pred.copy()
+            
+            # Save best model
             model_path = os.path.join(args.output_dir, 'best_model.pt')
             print(f"Saving best model checkpoint to {model_path}")
             torch.save({'epoch': epoch,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
-                        'loss': test_loss,
-                        'args': vars(args)  # Save training arguments
+                        'loss': valid_perf[dataset.eval_metric],
+                        'args': vars(args)
                         }, model_path)
 
-        test_true_value = reduce(operator.add, t_true.tolist())
-        valid_true_value = reduce(operator.add, v_true.tolist())
+        # 清理大型变量以节省内存
+        del train_true, train_pred, v_true, v_pred, t_true, t_pred
+        del current_test_pred, current_valid_pred
+        
+        # 每个epoch结束时进行一次垃圾回收
+        import gc
+        gc.collect()
 
+        # Calculate best epoch index based on task type
         if 'classification' in dataset.task_type:
             best_val_epoch = np.argmax(np.array(valid_curve))
-            best_train = max(train_curve)
         else:
             best_val_epoch = np.argmin(np.array(valid_curve))
-            best_train = min(train_curve)
 
         print('Epoch training completed!')
         print(f'Best validation score (epoch {best_val_epoch+1}): {valid_curve[best_val_epoch]:.6f}')
@@ -598,31 +608,33 @@ def main():
                 'train': train_curve,
                 'valid': valid_curve,
                 'test': test_curve,
-                'train_loss': train_loss_curve,  # Add training loss curve
-                'learning_rate': learning_rate_curve  # Add learning rate curve
+                'train_loss': train_loss_curve,
+                'learning_rate': learning_rate_curve
             }
         }
 
         if 'classification' not in dataset.task_type:
-            final_test_mape = calculate_mape(test_true_value, test_predict_value[-1])
+            # 使用正确的变量名和最佳预测结果
+            if 'best_test_pred' in locals():
+                final_test_mape = calculate_mape(final_test_true, best_test_pred)
+            else:
+                final_test_mape = calculate_mape(final_test_true, final_test_true)  # fallback
             result['metrics']['test_mape'] = final_test_mape
             print(f'Final test MAPE: {final_test_mape:.2f}%')
 
-            mape_curve = []
-            for epoch_preds in test_predict_value:
-                epoch_mape = calculate_mape(test_true_value, epoch_preds)
-                mape_curve.append(epoch_mape)
+            # Add MAPE curve to results
             result['curves']['mape'] = mape_curve
 
-            best_preds = test_predict_value[best_val_epoch]
-            errors = [abs(pred - true) for pred, true in zip(best_preds, test_true_value)]
-            result['error_stats'] = {
-                'min': min(errors),
-                'max': max(errors),
-                'mean': sum(errors) / len(errors),
-                'median': sorted(errors)[len(errors) // 2],
-                'percentile_90': sorted(errors)[int(len(errors) * 0.9)]
-            }
+            if 'best_test_pred' in locals():
+                best_preds = best_test_pred
+                errors = [abs(pred - true) for pred, true in zip(best_preds, final_test_true)]
+                result['error_stats'] = {
+                    'min': min(errors),
+                    'max': max(errors),
+                    'mean': sum(errors) / len(errors),
+                    'median': sorted(errors)[len(errors) // 2],
+                    'percentile_90': sorted(errors)[int(len(errors) * 0.9)]
+                }
 
         with open(results_path, 'w') as f:
             json.dump(result, f, indent=4)
@@ -637,24 +649,15 @@ def main():
     print(f"Training completed at: {end_time}")
     print(f"Total training duration: {end_time - start_time}")
     
-    # Save comprehensive training plots (replace the simple loss plot)
+    # Save comprehensive training plots with MAPE curve
     if train_loss_curve and train_curve and valid_curve and test_curve:
-        mape_curve_for_plot = None
-        if 'classification' not in dataset.task_type and test_predict_value:
-            # Calculate MAPE curve for each epoch
-            mape_curve_for_plot = []
-            for epoch_preds in test_predict_value:
-                if len(epoch_preds) > 0 and len(test_true_value) > 0:
-                    epoch_mape = calculate_mape(test_true_value, epoch_preds)
-                    mape_curve_for_plot.append(epoch_mape)
-        
         save_comprehensive_training_plots(
             train_loss_curve=train_loss_curve,
             train_curve=train_curve, 
             valid_curve=valid_curve, 
             test_curve=test_curve,
             learning_rate_curve=learning_rate_curve,
-            mape_curve=mape_curve_for_plot,
+            mape_curve=mape_curve if 'classification' not in dataset.task_type and mape_curve else None,
             task_type=dataset.task_type,
             eval_metric=dataset.eval_metric,
             output_dir=args.output_dir
@@ -662,14 +665,20 @@ def main():
     
     
     # Prepare best metrics for README
+    if 'classification' in dataset.task_type:
+        best_val_epoch = np.argmax(np.array(valid_curve))
+    else:
+        best_val_epoch = np.argmin(np.array(valid_curve))
+        
     best_metrics = {
         'validation_score': valid_curve[best_val_epoch],
         'test_score': test_curve[best_val_epoch],
         'train_score': train_curve[best_val_epoch]
     }
     
-    if 'classification' not in dataset.task_type and test_predict_value:
-        final_test_mape = calculate_mape(test_true_value, test_predict_value[best_val_epoch])
+    # 使用正确的变量名
+    if 'classification' not in dataset.task_type and 'best_test_pred' in locals() and 'final_test_true' in locals():
+        final_test_mape = calculate_mape(final_test_true, best_test_pred)
         best_metrics['test_mape'] = f"{final_test_mape:.2f}%"
     
     # Save comprehensive training information
