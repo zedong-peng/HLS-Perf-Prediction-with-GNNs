@@ -389,14 +389,18 @@ def main():
             self.num_tasks = original_dataset.num_tasks
             self.task_type = original_dataset.task_type
             self.eval_metric = original_dataset.eval_metric
-            # Create new split indices based on filtered data
+            
+            # 使用随机分割而不是顺序分割
             total_len = len(data_list)
+            indices = np.random.permutation(total_len)  # 随机打乱索引
+            
             train_len = int(0.8 * total_len)
             valid_len = int(0.1 * total_len)
+            
             self._split_idx = {
-                'train': list(range(train_len)),
-                'valid': list(range(train_len, train_len + valid_len)),
-                'test': list(range(train_len + valid_len, total_len))
+                'train': indices[:train_len].tolist(),
+                'valid': indices[train_len:train_len + valid_len].tolist(),
+                'test': indices[train_len + valid_len:].tolist()
             }
         
         def get_idx_split(self):
@@ -508,9 +512,10 @@ def main():
         train_loss_curve.append(epoch_loss)
 
         print('Evaluation phase...')
-        train_perf, train_true, train_pred = eval(model, device, train_loader, evaluator)
-        valid_perf, v_true, v_pred = eval(model, device, valid_loader, evaluator)
-        test_perf, t_true, t_pred = eval(model, device, standard_test_loader, evaluator)
+        with torch.no_grad():
+            train_perf, train_true, train_pred = eval(model, device, train_loader, evaluator)
+            valid_perf, v_true, v_pred = eval(model, device, valid_loader, evaluator)
+            test_perf, t_true, t_pred = eval(model, device, standard_test_loader, evaluator)
 
         if 'classification' not in dataset.task_type:
             train_true_list = reduce(operator.add, train_true.tolist())
