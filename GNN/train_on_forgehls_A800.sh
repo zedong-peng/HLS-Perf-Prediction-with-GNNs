@@ -1,0 +1,30 @@
+#!/bin/bash
+set -e
+
+# 定义清理函数，用于捕获中断信号
+cleanup() {
+    echo "接收到中断信号，正在终止所有后台进程..."
+    # 杀死所有子进程
+    pkill -P $$
+    exit 1
+}
+
+# 捕获中断信号（Ctrl+C）
+trap cleanup SIGINT SIGTERM
+
+# GPU:8*A800 80GB CPU:128 cores
+
+# pna, rgcn, gat, sage, arma, film, ggnn, pan, sgn, unet, gin-virtual, gcn-virtual, gin, gcn
+python src/train.py --output_dir saves/rgcn/forgehls/dsp --gnn rgcn --dataset cdfg_dsp_all_numerical_forgehls --lr 0.0005 --batch_size=32 --num_workers 3 --emb_dim 300 --device 0 --epochs 600 &
+python src/train.py --output_dir saves/rgcn/forgehls/dsp --gnn rgcn --dataset cdfg_dsp_all_numerical_forgehls --lr 0.0005 --batch_size=32 --num_workers 3 --emb_dim 300 --device 1 --epochs 600 &
+python src/train.py --output_dir saves/rgcn/forgehls/dsp --gnn rgcn --dataset cdfg_dsp_all_numerical_forgehls --lr 0.0005 --batch_size=32 --num_workers 3 --emb_dim 300 --device 2 --epochs 600 &
+
+python src/train.py --output_dir saves/sage/forgehls/dsp --gnn sage --dataset cdfg_dsp_all_numerical_forgehls --lr 0.0005 --batch_size=32 --num_workers 3 --emb_dim 300 --device 3 --epochs 600 &
+python src/train.py --output_dir saves/sage/forgehls/dsp --gnn sage --dataset cdfg_dsp_all_numerical_forgehls --lr 0.0005 --batch_size=32 --num_workers 3 --emb_dim 300 --device 4 --epochs 600 &
+python src/train.py --output_dir saves/sage/forgehls/dsp --gnn sage --dataset cdfg_dsp_all_numerical_forgehls --lr 0.0005 --batch_size=32 --num_workers 3 --emb_dim 300 --device 5 --epochs 600 &
+
+# 等待所有后台任务完成
+wait
+
+echo "所有训练任务已完成！"
+

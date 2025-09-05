@@ -7,3 +7,9 @@
 **/.DS_Store
 
 !GNN/master.csv
+
+env
+GNN/dataset
+GNN/saves
+Graphs/forgehls_kernels
+GNN/src/differential_output_e2e

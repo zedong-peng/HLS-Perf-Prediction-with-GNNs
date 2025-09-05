@@ -19,10 +19,8 @@ trap cleanup SIGINT SIGTERM
 #!/bin/bash
 
 # gnns=("pna" "rgcn" "sage" "gat" "arma" "film" "ggnn" "pan" "sgn" "unet" "gin-virtual" "gcn-virtual" "gin" "gcn")
-# gnns=("rgcn" "sage")
-gnns=("sage")
-
-datasets=("all_numerical_forgehls_10designs")
+gnns=("gat")
+datasets=("all_numerical_forgehls_kernels")
 features=("dsp" "lut" "ff")
 
 for gnn in "${gnns[@]}"; do
@@ -34,8 +32,10 @@ for gnn in "${gnns[@]}"; do
         --gnn "${gnn}" \
         --dataset "cdfg_${feature}_${dataset}" \
         --num_workers 3 \
-        # --emb_dim 128 \
-        --device 0
+        --drop_ratio 0.5 \
+        --lr 0.001 \
+        --epochs 300 \
+        --device 0 &
     done
   done
 done

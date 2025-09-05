@@ -1,0 +1,1203 @@
+#!/usr/bin/env python3
+"""
+End-to-End Differential Learning Training Script
+===============================================
+
+This script processes raw kernel and design folders to create paired datasets
+and train differential GNN models for performance prediction.
+
+Paths:
+- Design: /home/user/zedongpeng/workspace/Huggingface/forgehls_lite_10designs/source_name/algo_name/design_**/
+- Kernel: /home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/Graphs/forgehls_kernels/kernels/source_name/algo_name/
+
+Author: Zedong Peng
+Date: 2025-01-XX
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.data import Data, DataLoader
+from torch_geometric.nn import GCNConv, global_mean_pool
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+import os
+import json
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from tqdm import tqdm
+import argparse
+from datetime import datetime
+import matplotlib.pyplot as plt
+import xml.etree.ElementTree as ET
+from typing import Dict, List, Tuple, Optional
+import re
+import shutil
+import glob
+import swanlab
+import hashlib
+
+# 重用现有的图处理函数
+from pre_process_forgehls import (
+    parse_xml_into_graph_single, node_to_feature_vector, edge_to_feature_vector,
+    get_node_feature_dims, get_edge_feature_dims
+)
+
+
+# ============================================================================
+# Data Collection and Pairing
+# ============================================================================
+
+class E2EDifferentialProcessor:
+    """端到端差值数据处理器"""
+    
+    def __init__(self, kernel_base_dir: str, design_base_dir: str, output_dir: str,
+                 cache_root: str = "./graph_cache", rebuild_cache: bool = False):
+        self.kernel_base_dir = kernel_base_dir
+        self.design_base_dir = design_base_dir
+        self.output_dir = output_dir
+        self.rebuild_cache = rebuild_cache
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 图缓存路径 - 根据kernel/design根目录生成隔离的子目录，避免不同数据源相互污染
+        kb = os.path.abspath(self.kernel_base_dir)
+        db = os.path.abspath(self.design_base_dir)
+        cache_key_src = f"kb={kb}|db={db}"
+        cache_key = hashlib.md5(cache_key_src.encode("utf-8")).hexdigest()[:12]
+        self.graph_cache_dir = os.path.join(cache_root, cache_key)
+        os.makedirs(self.graph_cache_dir, exist_ok=True)
+        # 写入元信息，方便排查
+        try:
+            meta_path = os.path.join(self.graph_cache_dir, "meta.json")
+            if not os.path.exists(meta_path):
+                with open(meta_path, 'w') as mf:
+                    json.dump({
+                        "kernel_base_dir": kb,
+                        "design_base_dir": db,
+                        "cache_key": cache_key
+                    }, mf, indent=2)
+        except Exception:
+            pass
+        
+        # 静默初始化，减少console输出
+        pass
+    
+    def collect_all_data(self) -> List[Dict]:
+        """收集所有kernel-design配对数据"""
+        # 检查是否存在缓存的配对数据
+        cache_file = os.path.join(self.graph_cache_dir, "paired_graphs.json")
+        if (not self.rebuild_cache) and os.path.exists(cache_file):
+            return self._load_cached_pairs(cache_file)
+        
+        pairs = []
+        kernel_base = Path(self.kernel_base_dir)
+        design_base = Path(self.design_base_dir)
+        
+        # 检查路径
+        if not kernel_base.exists():
+            print(f"错误: Kernel路径不存在: {kernel_base}")
+            return pairs
+        if not design_base.exists():
+            print(f"错误: Design路径不存在: {design_base}")
+            return pairs
+        
+        # 遍历design目录寻找配对 - 静默处理
+        for source_dir in tqdm(list(design_base.iterdir()), desc="处理数据源"):
+            if not source_dir.is_dir():
+                continue
+                
+            source_name = source_dir.name
+            
+            for algo_dir in source_dir.iterdir():
+                if not algo_dir.is_dir():
+                    continue
+                    
+                algo_name = algo_dir.name
+                
+                # 查找对应的kernel
+                kernel_path = kernel_base / "kernels" / source_name / algo_name
+                if not kernel_path.exists():
+                    continue
+                
+                # 收集kernel数据
+                kernel_data = self._collect_kernel_data(kernel_path, source_name, algo_name)
+                if not kernel_data:
+                    continue
+                
+                # 收集所有design数据
+                for design_dir in algo_dir.iterdir():
+                    if design_dir.is_dir() and design_dir.name.startswith('design_'):
+                        design_id = design_dir.name
+                        
+                        design_data = self._collect_design_data(design_dir, source_name, algo_name, design_id)
+                        if design_data:
+                            # 创建配对
+                            pair = self._create_pair(kernel_data, design_data)
+                            if pair:
+                                pairs.append(pair)
+        
+        # 缓存配对数据
+        if pairs:
+            self._save_cached_pairs(pairs, cache_file)
+        
+        return pairs
+    
+    def _collect_kernel_data(self, kernel_path: Path, source_name: str, algo_name: str) -> Optional[Dict]:
+        """收集单个kernel的数据"""
+        try:
+            # 查找csynth.xml文件
+            csynth_files = list(kernel_path.rglob("csynth.xml"))
+            if not csynth_files:
+                return None
+            
+            # 解析性能数据
+            perf_data = self._parse_csynth_xml(csynth_files[0])
+            if not perf_data:
+                return None
+            
+            # 查找图文件
+            graph_files = list(kernel_path.rglob("*.adb"))
+            if not graph_files:
+                return None
+            
+            # 处理图数据
+            graph_data = self._process_graph_file(graph_files[0])
+            if not graph_data:
+                return None
+            
+            return {
+                'type': 'kernel',
+                'source_name': source_name,
+                'algo_name': algo_name,
+                'base_path': str(kernel_path),
+                'performance': perf_data,
+                'graph': graph_data,
+                'pragma_info': {'pragma_count': 0}  # kernel没有pragma
+            }
+            
+        except Exception as e:
+            return None
+    
+    def _collect_design_data(self, design_path: Path, source_name: str, algo_name: str, design_id: str) -> Optional[Dict]:
+        """收集单个design的数据"""
+        try:
+            # 查找csynth.xml文件
+            csynth_files = list(design_path.rglob("csynth.xml"))
+            if not csynth_files:
+                return None
+            
+            # 解析性能数据
+            perf_data = self._parse_csynth_xml(csynth_files[0])
+            if not perf_data:
+                return None
+            
+            # 查找图文件
+            graph_files = list(design_path.rglob("*.adb"))
+            if not graph_files:
+                return None
+            
+            # 处理图数据
+            graph_data = self._process_graph_file(graph_files[0])
+            if not graph_data:
+                return None
+            
+            # 提取pragma信息
+            pragma_info = self._extract_pragma_info(design_path)
+            
+            return {
+                'type': 'design',
+                'source_name': source_name,
+                'algo_name': algo_name,
+                'design_id': design_id,
+                'base_path': str(design_path),
+                'performance': perf_data,
+                'graph': graph_data,
+                'pragma_info': pragma_info
+            }
+            
+        except Exception as e:
+            return None
+    
+    def _parse_csynth_xml(self, xml_path: Path) -> Optional[Dict]:
+        """解析csynth.xml文件"""
+        try:
+            tree = ET.parse(xml_path)
+            root = tree.getroot()
+            
+            # 提取性能数据
+            best_latency = root.find('.//PerformanceEstimates/SummaryOfOverallLatency/Best-caseLatency')
+            dsp = root.find('.//AreaEstimates/Resources/DSP')
+            lut = root.find('.//AreaEstimates/Resources/LUT')
+            ff = root.find('.//AreaEstimates/Resources/FF')
+            
+            if (best_latency is not None and best_latency.text != 'undef' and
+                dsp is not None and lut is not None and ff is not None):
+                
+                return {
+                    'best_latency': float(best_latency.text),
+                    'DSP': int(dsp.text),
+                    'LUT': int(lut.text),
+                    'FF': int(ff.text)
+                }
+        except Exception as e:
+            return None
+        
+        return None
+    
+    def _process_graph_file(self, adb_path: Path) -> Optional[Data]:
+        """处理图文件，转换为PyTorch Geometric格式"""
+        try:
+            # 解析XML图
+            G = parse_xml_into_graph_single(str(adb_path))
+            if G is None or len(G.nodes()) == 0:
+                return None
+            
+            # 转换为PyTorch Geometric格式
+            nodes = list(G.nodes())
+            edges = list(G.edges())
+            
+            if len(nodes) == 0:
+                return None
+            
+            # 构建节点特征
+            node_features = []
+            node_mapping = {node: i for i, node in enumerate(nodes)}
+            
+            for node in nodes:
+                node_attr = G.nodes[node] if node in G.nodes else {}
+                node_feat = node_to_feature_vector(node_attr)
+                node_features.append(node_feat)
+            
+            # 构建边索引和边特征
+            edge_index = []
+            edge_features = []
+            
+            for edge in edges:
+                if edge[0] in node_mapping and edge[1] in node_mapping:
+                    source_idx = node_mapping[edge[0]]
+                    target_idx = node_mapping[edge[1]]
+                    edge_index.append([source_idx, target_idx])
+                    
+                    edge_attr = G.edges[edge] if edge in G.edges else {}
+                    edge_feat = edge_to_feature_vector(edge_attr)
+                    edge_features.append(edge_feat)
+            
+            if len(edge_index) == 0:
+                # 如果没有边，创建自环
+                edge_index = [[i, i] for i in range(len(nodes))]
+                edge_features = [[0, 0] for _ in range(len(nodes))]
+            
+            # 转换为tensor
+            x = torch.tensor(node_features, dtype=torch.float)
+            edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+            edge_attr = torch.tensor(edge_features, dtype=torch.float) if edge_features else None
+            
+            return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+            
+        except Exception as e:
+            print(f"处理图文件失败 {adb_path}: {e}")
+            return None
+    
+    def _extract_pragma_info(self, design_path: Path) -> Dict:
+        """提取pragma信息"""
+        pragma_info = {
+            'pragma_count': 0,
+            'pragma_types': {},
+            'optimization_pragmas': 0
+        }
+        
+        # 查找源代码文件
+        source_files = []
+        for ext in ['.c', '.cpp', '.h', '.hpp']:
+            source_files.extend(list(design_path.rglob(f"*{ext}")))
+        
+        pragma_patterns = {
+            'PIPELINE': r'#pragma\s+HLS\s+PIPELINE',
+            'UNROLL': r'#pragma\s+HLS\s+UNROLL',
+            'ARRAY_PARTITION': r'#pragma\s+HLS\s+ARRAY_PARTITION',
+            'DATAFLOW': r'#pragma\s+HLS\s+DATAFLOW',
+            'INLINE': r'#pragma\s+HLS\s+INLINE',
+            'INTERFACE': r'#pragma\s+HLS\s+INTERFACE'
+        }
+        
+        for source_file in source_files:
+            try:
+                with open(source_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                
+                for pragma_type, pattern in pragma_patterns.items():
+                    matches = re.findall(pattern, content, re.IGNORECASE)
+                    count = len(matches)
+                    pragma_info['pragma_types'][pragma_type] = pragma_info['pragma_types'].get(pragma_type, 0) + count
+                    pragma_info['pragma_count'] += count
+                    
+                    if pragma_type in ['PIPELINE', 'UNROLL', 'DATAFLOW', 'ARRAY_PARTITION']:
+                        pragma_info['optimization_pragmas'] += count
+                        
+            except Exception as e:
+                print(f"读取源文件失败 {source_file}: {e}")
+        
+        return pragma_info
+    
+    def _create_pair(self, kernel_data: Dict, design_data: Dict) -> Optional[Dict]:
+        """创建kernel-design配对"""
+        try:
+            # 验证数据完整性
+            if not all([
+                kernel_data.get('performance'),
+                design_data.get('performance'),
+                kernel_data.get('graph'),
+                design_data.get('graph')
+            ]):
+                return None
+            
+            # 计算性能差值
+            k_perf = kernel_data['performance']
+            d_perf = design_data['performance']
+            
+            performance_delta = {
+                'latency_delta': d_perf['best_latency'] - k_perf['best_latency'],
+                'dsp_delta': d_perf['DSP'] - k_perf['DSP'],
+                'lut_delta': d_perf['LUT'] - k_perf['LUT'],
+                'ff_delta': d_perf['FF'] - k_perf['FF']
+            }
+            
+            # 添加性能标签到图数据
+            kernel_graph = kernel_data['graph']
+            design_graph = design_data['graph']
+            
+            # 创建性能标签 [DSP/100, LUT/10000, FF/10000, latency/100]
+            kernel_graph.y = torch.tensor([
+                k_perf['DSP'] / 100.0,
+                k_perf['LUT'] / 10000.0,
+                k_perf['FF'] / 10000.0,
+                k_perf['best_latency'] / 100.0
+            ], dtype=torch.float).unsqueeze(0)
+            
+            design_graph.y = torch.tensor([
+                d_perf['DSP'] / 100.0,
+                d_perf['LUT'] / 10000.0,
+                d_perf['FF'] / 10000.0,
+                d_perf['best_latency'] / 100.0
+            ], dtype=torch.float).unsqueeze(0)
+            
+            return {
+                'pair_id': f"{kernel_data['source_name']}_{kernel_data['algo_name']}_{design_data['design_id']}",
+                'kernel_graph': kernel_graph,
+                'design_graph': design_graph,
+                'performance_delta': performance_delta,
+                'pragma_info': design_data['pragma_info'],
+                'kernel_info': kernel_data,
+                'design_info': design_data
+            }
+            
+        except Exception as e:
+            print(f"创建配对失败: {e}")
+            return None
+    
+    def _save_cached_pairs(self, pairs: List[Dict], cache_file: str):
+        """保存配对数据到缓存"""
+        # 将图数据转换为可序列化格式
+        cached_pairs = []
+        for pair in tqdm(pairs, desc="缓存图数据"):
+            cached_pair = {
+                'pair_id': pair['pair_id'],
+                'performance_delta': pair['performance_delta'],
+                'pragma_info': pair['pragma_info'],
+                'kernel_info': {k: v for k, v in pair['kernel_info'].items() if k != 'graph'},
+                'design_info': {k: v for k, v in pair['design_info'].items() if k != 'graph'},
+                # 保存图的tensor数据
+                'kernel_graph_data': {
+                    'x': pair['kernel_graph'].x.tolist(),
+                    'edge_index': pair['kernel_graph'].edge_index.tolist(),
+                    'edge_attr': pair['kernel_graph'].edge_attr.tolist() if pair['kernel_graph'].edge_attr is not None else None,
+                    'y': pair['kernel_graph'].y.tolist()
+                },
+                'design_graph_data': {
+                    'x': pair['design_graph'].x.tolist(),
+                    'edge_index': pair['design_graph'].edge_index.tolist(),
+                    'edge_attr': pair['design_graph'].edge_attr.tolist() if pair['design_graph'].edge_attr is not None else None,
+                    'y': pair['design_graph'].y.tolist()
+                }
+            }
+            cached_pairs.append(cached_pair)
+        
+        with open(cache_file, 'w') as f:
+            json.dump(cached_pairs, f, indent=2)
+    
+    def _load_cached_pairs(self, cache_file: str) -> List[Dict]:
+        """从缓存加载配对数据"""
+        with open(cache_file, 'r') as f:
+            cached_pairs = json.load(f)
+        
+        # 重建图数据
+        pairs = []
+        for cached_pair in tqdm(cached_pairs, desc="加载缓存图数据"):
+            try:
+                # 重建kernel图
+                k_data = cached_pair['kernel_graph_data']
+                kernel_graph = Data(
+                    x=torch.tensor(k_data['x'], dtype=torch.float),
+                    edge_index=torch.tensor(k_data['edge_index'], dtype=torch.long),
+                    edge_attr=torch.tensor(k_data['edge_attr'], dtype=torch.float) if k_data['edge_attr'] else None,
+                    y=torch.tensor(k_data['y'], dtype=torch.float)
+                )
+                
+                # 重建design图
+                d_data = cached_pair['design_graph_data']
+                design_graph = Data(
+                    x=torch.tensor(d_data['x'], dtype=torch.float),
+                    edge_index=torch.tensor(d_data['edge_index'], dtype=torch.long),
+                    edge_attr=torch.tensor(d_data['edge_attr'], dtype=torch.float) if d_data['edge_attr'] else None,
+                    y=torch.tensor(d_data['y'], dtype=torch.float)
+                )
+                
+                pair = {
+                    'pair_id': cached_pair['pair_id'],
+                    'kernel_graph': kernel_graph,
+                    'design_graph': design_graph,
+                    'performance_delta': cached_pair['performance_delta'],
+                    'pragma_info': cached_pair['pragma_info'],
+                    'kernel_info': cached_pair['kernel_info'],
+                    'design_info': cached_pair['design_info']
+                }
+                
+                pairs.append(pair)
+                
+            except Exception as e:
+                continue
+        
+        return pairs
+
+
+# ============================================================================
+# Differential GNN Model
+# ============================================================================
+
+class SimpleDifferentialGNN(nn.Module):
+    """简化的差值学习GNN模型"""
+    
+    def __init__(self, node_dim: int, hidden_dim: int = 128, num_layers: int = 3, 
+                 dropout: float = 0.1, target_metric: str = 'dsp'):
+        super().__init__()
+        self.target_metric = target_metric
+        self.hidden_dim = hidden_dim
+        
+        # 节点编码器
+        self.node_encoder = nn.Linear(node_dim, hidden_dim)
+        
+        # GCN层
+        self.convs = nn.ModuleList()
+        for _ in range(num_layers):
+            self.convs.append(GCNConv(hidden_dim, hidden_dim))
+        
+        # 差值预测头
+        self.delta_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),  # kernel + design
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        # 基线预测头
+        self.baseline_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+        
+        # 指标索引映射
+        self.metric_idx = {'dsp': 0, 'lut': 1, 'ff': 2, 'latency': 3}[target_metric]
+        
+        # 权重初始化
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化权重"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def encode_graph(self, data):
+        """编码图"""
+        x = self.node_encoder(data.x.float())
+        
+        for conv in self.convs:
+            x = F.relu(conv(x, data.edge_index))
+        
+        # 图级别池化
+        batch = data.batch if hasattr(data, 'batch') else torch.zeros(data.x.size(0), dtype=torch.long, device=data.x.device)
+        return global_mean_pool(x, batch)
+    
+    def forward(self, kernel_graph, design_graph, pragma_count):
+        """前向传播"""
+        # 编码图
+        kernel_repr = self.encode_graph(kernel_graph)
+        design_repr = self.encode_graph(design_graph)
+        
+        # Pragma嵌入 - 暂时注释掉
+        # pragma_emb = self.pragma_embedding(pragma_count.clamp(0, 49))
+        
+        # 预测基线（kernel性能）
+        baseline_pred = self.baseline_head(kernel_repr)
+        
+        # 预测差值
+        combined = torch.cat([kernel_repr, design_repr], dim=-1) 
+        delta_pred = self.delta_head(combined)
+        
+        # 最终预测
+        final_pred = baseline_pred + delta_pred
+        
+        return {
+            'baseline_pred': baseline_pred,
+            'delta_pred': delta_pred,
+            'final_pred': final_pred
+        }
+
+
+# ============================================================================
+# Dataset Class
+# ============================================================================
+
+class E2EDifferentialDataset(torch.utils.data.Dataset):
+    """端到端差值学习数据集"""
+    
+    def __init__(self, pairs: List[Dict], target_metric: str = 'dsp'):
+        self.pairs = pairs
+        self.target_metric = target_metric
+        self.metric_idx = {'dsp': 0, 'lut': 1, 'ff': 2, 'latency': 3}[target_metric]
+    
+    def __len__(self):
+        return len(self.pairs)
+    
+    def __getitem__(self, idx):
+        pair = self.pairs[idx]
+        
+        kernel_graph = pair['kernel_graph']
+        design_graph = pair['design_graph']
+        
+        # 提取目标指标的性能值
+        kernel_perf = kernel_graph.y[0, self.metric_idx].unsqueeze(0)
+        design_perf = design_graph.y[0, self.metric_idx].unsqueeze(0)
+        
+        # 计算差值
+        delta_key = f'{self.target_metric}_delta' if self.target_metric != 'latency' else 'latency_delta'
+        perf_delta = torch.tensor([pair['performance_delta'][delta_key]], dtype=torch.float)
+        
+        # Pragma计数
+        pragma_count = torch.tensor([pair['pragma_info']['pragma_count']], dtype=torch.long)
+        
+        return {
+            'kernel_graph': kernel_graph,
+            'design_graph': design_graph,
+            'kernel_perf': kernel_perf,
+            'design_perf': design_perf,
+            'performance_delta': perf_delta,
+            'pragma_count': pragma_count,
+            'pair_id': pair['pair_id']
+        }
+
+
+def differential_collate_fn(batch):
+    """自定义批处理函数"""
+    from torch_geometric.loader import DataLoader as PygDataLoader
+    
+    kernel_graphs = [item['kernel_graph'] for item in batch]
+    design_graphs = [item['design_graph'] for item in batch]
+    
+    kernel_perfs = torch.cat([item['kernel_perf'] for item in batch], dim=0)
+    design_perfs = torch.cat([item['design_perf'] for item in batch], dim=0)
+    perf_deltas = torch.cat([item['performance_delta'] for item in batch], dim=0)
+    pragma_counts = torch.cat([item['pragma_count'] for item in batch], dim=0)
+    
+    # 使用PyG批处理
+    kernel_loader = PygDataLoader(kernel_graphs, batch_size=len(kernel_graphs), shuffle=False)
+    design_loader = PygDataLoader(design_graphs, batch_size=len(design_graphs), shuffle=False)
+    
+    kernel_batch = next(iter(kernel_loader))
+    design_batch = next(iter(design_loader))
+    
+    return {
+        'kernel_graph': kernel_batch,
+        'design_graph': design_batch,
+        'kernel_perf': kernel_perfs,
+        'design_perf': design_perfs,
+        'performance_delta': perf_deltas,
+        'pragma_count': pragma_counts
+    }
+
+
+# ============================================================================
+# Training Functions
+# ============================================================================
+
+def train_epoch(model, device, train_loader, optimizer):
+    """训练一个epoch"""
+    model.train()
+    total_loss = 0
+    batch_count = 0
+    
+    for batch in train_loader:
+        optimizer.zero_grad()
+        
+        # 移动到设备
+        kernel_graph = batch['kernel_graph'].to(device)
+        design_graph = batch['design_graph'].to(device)
+        pragma_count = batch['pragma_count'].to(device)
+        
+        # 前向传播
+        predictions = model(kernel_graph, design_graph, pragma_count)
+        
+        # 计算损失
+        targets = {
+            'kernel_perf': batch['kernel_perf'].to(device),
+            'design_perf': batch['design_perf'].to(device),
+            'performance_delta': batch['performance_delta'].to(device)
+        }
+        
+        # 多任务损失 - 修复维度不匹配问题
+        baseline_loss = F.mse_loss(predictions['baseline_pred'].squeeze(), targets['kernel_perf'].squeeze())
+        delta_loss = F.mse_loss(predictions['delta_pred'].squeeze(), targets['performance_delta'].squeeze())
+        final_loss = F.mse_loss(predictions['final_pred'].squeeze(), targets['design_perf'].squeeze())
+        
+        # 组合损失
+        total_batch_loss = 0.3 * baseline_loss + 0.5 * delta_loss + 0.2 * final_loss
+        
+        # 反向传播 - 添加梯度裁剪
+        total_batch_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        
+        total_loss += total_batch_loss.item()
+        batch_count += 1
+    
+    return total_loss / batch_count if batch_count > 0 else float('inf')
+
+
+def evaluate_model(model, device, data_loader):
+    """评估模型"""
+    model.eval()
+    total_loss = 0
+    batch_count = 0
+    
+    all_delta_preds = []
+    all_delta_true = []
+    all_final_preds = []
+    all_final_true = []
+    
+    with torch.no_grad():
+        for batch in data_loader:
+            # 移动到设备
+            kernel_graph = batch['kernel_graph'].to(device)
+            design_graph = batch['design_graph'].to(device)
+            pragma_count = batch['pragma_count'].to(device)
+            
+            # 前向传播
+            predictions = model(kernel_graph, design_graph, pragma_count)
+            
+            # 准备目标值
+            targets = {
+                'kernel_perf': batch['kernel_perf'].to(device),
+                'design_perf': batch['design_perf'].to(device),
+                'performance_delta': batch['performance_delta'].to(device)
+            }
+            
+            # 计算损失 - 修复维度不匹配问题
+            baseline_loss = F.mse_loss(predictions['baseline_pred'].squeeze(), targets['kernel_perf'].squeeze())
+            delta_loss = F.mse_loss(predictions['delta_pred'].squeeze(), targets['performance_delta'].squeeze())
+            final_loss = F.mse_loss(predictions['final_pred'].squeeze(), targets['design_perf'].squeeze())
+            total_batch_loss = 0.3 * baseline_loss + 0.5 * delta_loss + 0.2 * final_loss
+            
+            total_loss += total_batch_loss.item()
+            batch_count += 1
+            
+            # 收集预测结果
+            all_delta_preds.append(predictions['delta_pred'].cpu())
+            all_delta_true.append(targets['performance_delta'].cpu())
+            all_final_preds.append(predictions['final_pred'].cpu())
+            all_final_true.append(targets['design_perf'].cpu())
+    
+    # 计算评估指标
+    avg_loss = total_loss / batch_count if batch_count > 0 else float('inf')
+    
+    if all_delta_preds:
+        delta_preds = torch.cat(all_delta_preds, dim=0)
+        delta_true = torch.cat(all_delta_true, dim=0)
+        final_preds = torch.cat(all_final_preds, dim=0)
+        final_true = torch.cat(all_final_true, dim=0)
+        
+        # 计算指标 - 修复维度不匹配问题
+        delta_rmse = torch.sqrt(F.mse_loss(delta_preds.squeeze(), delta_true.squeeze())).item()
+        delta_mae = F.l1_loss(delta_preds.squeeze(), delta_true.squeeze()).item()
+        final_rmse = torch.sqrt(F.mse_loss(final_preds.squeeze(), final_true.squeeze())).item()
+        final_mae = F.l1_loss(final_preds.squeeze(), final_true.squeeze()).item()
+        
+        # MAPE和SMAPE计算 - 修复维度问题
+        delta_true_sq = delta_true.squeeze()
+        delta_preds_sq = delta_preds.squeeze()
+        final_true_sq = final_true.squeeze()
+        final_preds_sq = final_preds.squeeze()
+        
+        # MAPE (避免除零)
+        delta_mape = torch.mean(torch.abs((delta_true_sq - delta_preds_sq) / (torch.abs(delta_true_sq) + 1e-8))).item() * 100
+        final_mape = torch.mean(torch.abs((final_true_sq - final_preds_sq) / (torch.abs(final_true_sq) + 1e-8))).item() * 100
+        
+        # SMAPE (对称平均绝对百分比误差)
+        delta_smape = torch.mean(2 * torch.abs(delta_true_sq - delta_preds_sq) / (torch.abs(delta_true_sq) + torch.abs(delta_preds_sq) + 1e-8)).item() * 100
+        final_smape = torch.mean(2 * torch.abs(final_true_sq - final_preds_sq) / (torch.abs(final_true_sq) + torch.abs(final_preds_sq) + 1e-8)).item() * 100
+        
+        metrics_dict = {
+            'avg_loss': avg_loss,
+            'delta_rmse': delta_rmse,
+            'delta_mae': delta_mae,
+            'delta_mape': delta_mape,
+            'delta_smape': delta_smape,
+            'final_rmse': final_rmse,
+            'final_mae': final_mae,
+            'final_mape': final_mape,
+            'final_smape': final_smape
+        }
+        
+        # 只在需要时添加tensor数据（用于散点图）
+        if len(delta_preds_sq) > 0:
+            metrics_dict.update({
+                'delta_preds': delta_preds_sq,
+                'delta_true': delta_true_sq,
+                'final_preds': final_preds_sq,
+                'final_true': final_true_sq
+            })
+        
+        return metrics_dict
+    
+    return {'avg_loss': avg_loss}
+
+
+def _create_prediction_plots(test_metrics: Dict, target_metric: str, output_dir: str):
+    """创建预测vs真实值散点图"""
+    delta_true = test_metrics['delta_true'].cpu().numpy()
+    delta_preds = test_metrics['delta_preds'].cpu().numpy()
+    final_true = test_metrics['final_true'].cpu().numpy()
+    final_preds = test_metrics['final_preds'].cpu().numpy()
+    
+    # 创建子图
+    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+    fig.suptitle(f'Prediction vs Ground Truth - {target_metric.upper()}', fontsize=16)
+    
+    # 差值预测散点图
+    axes[0].scatter(delta_true, delta_preds, alpha=0.6, s=50)
+    min_val = min(delta_true.min(), delta_preds.min())
+    max_val = max(delta_true.max(), delta_preds.max())
+    axes[0].plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8, linewidth=2, label='Perfect Prediction')
+    axes[0].set_xlabel(f'True Delta {target_metric.upper()}')
+    axes[0].set_ylabel(f'Predicted Delta {target_metric.upper()}')
+    axes[0].set_title(f'Performance Delta Prediction (Δ{target_metric.upper()})')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # 最终性能预测散点图
+    axes[1].scatter(final_true, final_preds, alpha=0.6, s=50, color='orange')
+    min_val = min(final_true.min(), final_preds.min())
+    max_val = max(final_true.max(), final_preds.max())
+    axes[1].plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8, linewidth=2, label='Perfect Prediction')
+    axes[1].set_xlabel(f'True Final {target_metric.upper()}')
+    axes[1].set_ylabel(f'Predicted Final {target_metric.upper()}')
+    axes[1].set_title(f'Final Performance Prediction ({target_metric.upper()})')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    scatter_path = os.path.join(output_dir, f'prediction_scatter_{target_metric}.png')
+    plt.savefig(scatter_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # 上传到SwanLab
+    swanlab.log({"prediction_scatter": swanlab.Image(scatter_path)})
+
+
+# ============================================================================
+# Main Training Function
+# ============================================================================
+
+def main():
+    """主函数"""
+    parser = argparse.ArgumentParser(description='端到端差值学习GNN训练')
+    
+    # 路径参数
+    parser.add_argument('--kernel_base_dir', type=str,
+                        default='/home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/Graphs/forgehls_kernels/',
+                        help='Kernel数据根目录')
+    parser.add_argument('--design_base_dir', type=str,
+                        default='/home/user/zedongpeng/workspace/Huggingface/forgehls_lite_10designs/',
+                        help='Design数据根目录')
+    
+    # 模型参数
+    parser.add_argument('--target_metric', type=str, default='dsp',
+                        choices=['dsp', 'lut', 'ff', 'latency'],
+                        help='目标预测指标')
+    parser.add_argument('--hidden_dim', type=int, default=128, help='隐藏层维度')
+    parser.add_argument('--num_layers', type=int, default=3, help='GNN层数')
+    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout率')
+    
+    # 训练参数
+    parser.add_argument('--batch_size', type=int, default=8, help='批大小')
+    parser.add_argument('--lr', type=float, default=0.001, help='学习率')
+    parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
+    parser.add_argument('--device', type=int, default=0, help='GPU设备ID')
+    
+    # 输出参数
+    parser.add_argument('--output_dir', type=str, default='./differential_output_e2e', help='输出目录')
+    # 缓存参数
+    parser.add_argument('--cache_root', type=str, default='./graph_cache', help='图数据缓存根目录')
+    parser.add_argument('--rebuild_cache', action='store_true', help='忽略已有缓存并重新构建')
+    
+    # 调试参数
+    parser.add_argument('--max_pairs', type=int, default=None, help='最大配对数量（调试用）')
+    
+    args = parser.parse_args()
+    
+    # 设置设备
+    device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
+    
+    # 创建输出目录
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(args.output_dir, f"e2e_delta_{args.target_metric}_{timestamp}")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 初始化SwanLab
+    swanlab.init(
+        project="HLS-Differential-Learning",
+        experiment_name=f"E2E_Delta_{args.target_metric}_{timestamp}",
+        config=vars(args),
+        logdir=output_dir
+    )
+    
+    # ==================== 数据处理 ====================
+    
+    processor = E2EDifferentialProcessor(
+        kernel_base_dir=args.kernel_base_dir,
+        design_base_dir=args.design_base_dir,
+        output_dir=output_dir,
+        cache_root=args.cache_root,
+        rebuild_cache=args.rebuild_cache
+    )
+    
+    # 收集配对数据
+    pairs = processor.collect_all_data()
+    
+    if not pairs:
+        print("错误: 未找到有效的kernel-design配对")
+        swanlab.finish()
+        return
+    
+    # 记录数据集信息
+    swanlab.log({"dataset/total_pairs": len(pairs)})
+    
+    # 限制配对数量（调试用）
+    if args.max_pairs and len(pairs) > args.max_pairs:
+        pairs = pairs[:args.max_pairs]
+        swanlab.log({"dataset/limited_pairs": args.max_pairs})
+    
+    # 保存配对信息
+    pairs_info = []
+    for pair in pairs:
+        info = {
+            'pair_id': pair['pair_id'],
+            'source_name': pair['kernel_info']['source_name'],
+            'algo_name': pair['kernel_info']['algo_name'],
+            'design_id': pair['design_info']['design_id'],
+            'pragma_count': pair['pragma_info']['pragma_count'],
+            'performance_delta': pair['performance_delta']
+        }
+        pairs_info.append(info)
+    
+    pairs_path = os.path.join(output_dir, 'kernel_design_pairs.json')
+    with open(pairs_path, 'w') as f:
+        json.dump(pairs_info, f, indent=2)
+    
+    # 创建数据集
+    dataset = E2EDifferentialDataset(pairs, args.target_metric)
+    
+    # 数据集划分 - 8:1:1随机划分
+    total_size = len(dataset)
+    train_size = int(0.8 * total_size)
+    valid_size = int(0.1 * total_size)
+    test_size = total_size - train_size - valid_size
+    
+    indices = torch.randperm(total_size)
+    train_indices = indices[:train_size]
+    valid_indices = indices[train_size:train_size + valid_size]
+    test_indices = indices[train_size + valid_size:]
+    
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    valid_dataset = torch.utils.data.Subset(dataset, valid_indices)
+    test_dataset = torch.utils.data.Subset(dataset, test_indices)
+    
+    # 记录数据划分信息
+    swanlab.log({
+        "dataset/train_size": len(train_dataset),
+        "dataset/valid_size": len(valid_dataset), 
+        "dataset/test_size": len(test_dataset)
+    })
+    
+    # 创建数据加载器
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        collate_fn=differential_collate_fn, num_workers=0
+    )
+    valid_loader = torch.utils.data.DataLoader(
+        valid_dataset, batch_size=args.batch_size, shuffle=False,
+        collate_fn=differential_collate_fn, num_workers=0
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_dataset, batch_size=args.batch_size, shuffle=False,
+        collate_fn=differential_collate_fn, num_workers=0
+    )
+    
+    # ==================== 创建模型 ====================
+    
+    # 获取特征维度
+    sample_pair = dataset[0]
+    node_dim = sample_pair['kernel_graph'].x.size(1)
+    
+    # 创建模型
+    model = SimpleDifferentialGNN(
+        node_dim=node_dim,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+        target_metric=args.target_metric
+    ).to(device)
+    
+    # 优化器和调度器
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=15, verbose=False)
+    
+    # 记录模型信息
+    model_params = sum(p.numel() for p in model.parameters())
+    swanlab.log({
+        "model/node_dim": node_dim,
+        "model/total_params": model_params,
+        "model/hidden_dim": args.hidden_dim,
+        "model/num_layers": args.num_layers
+    })
+    
+    # ==================== 训练循环 ====================
+    
+    train_losses = []
+    valid_losses = []
+    test_losses = []
+    valid_metrics_history = []
+    test_metrics_history = []
+    
+    best_valid_loss = float('inf')
+    best_epoch = 0
+    
+    for epoch in range(1, args.epochs + 1):
+        # 训练
+        train_loss = train_epoch(model, device, train_loader, optimizer)
+        train_losses.append(train_loss)
+        
+        # 验证
+        valid_metrics = evaluate_model(model, device, valid_loader)
+        valid_loss = valid_metrics['avg_loss']
+        valid_losses.append(valid_loss)
+        valid_metrics_history.append(valid_metrics)
+        
+        # 测试
+        test_metrics = evaluate_model(model, device, test_loader)
+        test_loss = test_metrics['avg_loss']
+        test_losses.append(test_loss)
+        test_metrics_history.append(test_metrics)
+        
+        # 学习率调度
+        scheduler.step(valid_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # 记录到SwanLab
+        swanlab.log({
+            "epoch": epoch,
+            "train/loss": train_loss,
+            "valid/loss": valid_loss,
+            "valid/delta_rmse": valid_metrics.get('delta_rmse', 0),
+            "valid/delta_mape": valid_metrics.get('delta_mape', 0),
+            "valid/delta_smape": valid_metrics.get('delta_smape', 0),
+            "valid/final_rmse": valid_metrics.get('final_rmse', 0),
+            "test/loss": test_loss,
+            "test/delta_rmse": test_metrics.get('delta_rmse', 0),
+            "test/delta_mape": test_metrics.get('delta_mape', 0),
+            "test/delta_smape": test_metrics.get('delta_smape', 0),
+            "test/final_rmse": test_metrics.get('final_rmse', 0),
+            "test/final_mape": test_metrics.get('final_mape', 0),
+            "test/final_smape": test_metrics.get('final_smape', 0),
+            "optimizer/lr": current_lr
+        })
+        
+        # 保存最佳模型
+        if valid_loss < best_valid_loss:
+            best_valid_loss = valid_loss
+            best_epoch = epoch
+            
+            model_path = os.path.join(output_dir, f'best_e2e_delta_{args.target_metric}_model.pt')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'valid_loss': valid_loss,
+                'test_metrics': test_metrics,
+                'args': vars(args)
+            }, model_path)
+            
+            swanlab.log({"best_model/epoch": epoch, "best_model/valid_loss": valid_loss})
+    
+    # ==================== 保存结果 ====================
+    
+    # 最佳epoch的结果
+    if test_metrics_history:
+        best_test = test_metrics_history[best_epoch - 1]
+        
+        # 记录最终结果到SwanLab
+        swanlab.log({
+            "final/best_epoch": best_epoch,
+            "final/best_valid_loss": best_valid_loss,
+            "final/delta_rmse": best_test.get('delta_rmse', 0),
+            "final/delta_mape": best_test.get('delta_mape', 0),
+            "final/delta_smape": best_test.get('delta_smape', 0),
+            "final/final_rmse": best_test.get('final_rmse', 0),
+            "final/final_mape": best_test.get('final_mape', 0),
+            "final/final_smape": best_test.get('final_smape', 0)
+        })
+        
+        # 创建最佳epoch的预测vs真实散点图
+        if 'delta_preds' in best_test and 'delta_true' in best_test:
+            _create_prediction_plots(best_test, args.target_metric, output_dir)
+        
+        print(f"训练完成! 最佳模型 ({args.target_metric.upper()}):")
+        print(f"  Epoch: {best_epoch}, 差值RMSE: {best_test.get('delta_rmse', 0):.6f}")
+        print(f"  差值MAPE: {best_test.get('delta_mape', 0):.2f}%, SMAPE: {best_test.get('delta_smape', 0):.2f}%")
+        print(f"  最终RMSE: {best_test.get('final_rmse', 0):.6f}")
+    
+    # 保存训练历史 - 清理tensor数据避免JSON序列化错误
+    clean_valid_history = []
+    clean_test_history = []
+    
+    for metrics in valid_metrics_history:
+        clean_metrics = {k: v for k, v in metrics.items() if not isinstance(v, torch.Tensor)}
+        clean_valid_history.append(clean_metrics)
+    
+    for metrics in test_metrics_history:
+        clean_metrics = {k: v for k, v in metrics.items() if not isinstance(v, torch.Tensor)}
+        clean_test_history.append(clean_metrics)
+    
+    results = {
+        'train_losses': train_losses,
+        'valid_losses': valid_losses,
+        'test_losses': test_losses,
+        'valid_metrics_history': clean_valid_history,
+        'test_metrics_history': clean_test_history,
+        'best_epoch': best_epoch,
+        'best_valid_loss': best_valid_loss,
+        'args': vars(args),
+        'num_pairs': len(pairs)
+    }
+    
+    results_path = os.path.join(output_dir, 'e2e_differential_results.json')
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    # 创建训练曲线图
+    fig, axes = plt.subplots(2, 3, figsize=(20, 10))
+    fig.suptitle(f'E2E Differential Learning - {args.target_metric.upper()}', fontsize=16)
+    
+    epochs = range(1, len(train_losses) + 1)
+    
+    # 损失曲线
+    axes[0, 0].plot(epochs, train_losses, 'b-', label='Train Loss', linewidth=2)
+    axes[0, 0].plot(epochs, valid_losses, 'r-', label='Valid Loss', linewidth=2)
+    axes[0, 0].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7, label=f'Best Epoch')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].set_title('Training Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # 差值RMSE
+    if valid_metrics_history:
+        delta_rmse_valid = [m.get('delta_rmse', 0) for m in valid_metrics_history]
+        delta_rmse_test = [m.get('delta_rmse', 0) for m in test_metrics_history]
+        
+        axes[0, 1].plot(epochs, delta_rmse_valid, 'orange', label='Valid Delta RMSE', linewidth=2)
+        axes[0, 1].plot(epochs, delta_rmse_test, 'purple', label='Test Delta RMSE', linewidth=2)
+        axes[0, 1].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7)
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Delta RMSE')
+        axes[0, 1].set_title('Performance Delta Prediction')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+    
+    # 最终性能RMSE
+    if valid_metrics_history:
+        final_rmse_valid = [m.get('final_rmse', 0) for m in valid_metrics_history]
+        final_rmse_test = [m.get('final_rmse', 0) for m in test_metrics_history]
+        
+        axes[1, 0].plot(epochs, final_rmse_valid, 'cyan', label='Valid Final RMSE', linewidth=2)
+        axes[1, 0].plot(epochs, final_rmse_test, 'magenta', label='Test Final RMSE', linewidth=2)
+        axes[1, 0].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7)
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Final RMSE')
+        axes[1, 0].set_title('Final Performance Prediction')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+    
+    # MAPE曲线
+    if valid_metrics_history:
+        delta_mape_test = [m.get('delta_mape', 0) for m in test_metrics_history]
+        final_mape_test = [m.get('final_mape', 0) for m in test_metrics_history]
+        
+        axes[1, 1].plot(epochs, delta_mape_test, 'brown', label='Delta MAPE (%)', linewidth=2)
+        axes[1, 1].plot(epochs, final_mape_test, 'pink', label='Final MAPE (%)', linewidth=2)
+        axes[1, 1].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7)
+        axes[1, 1].set_xlabel('Epoch')
+        axes[1, 1].set_ylabel('MAPE (%)')
+        axes[1, 1].set_title('Mean Absolute Percentage Error')
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+    
+    # SMAPE曲线 (更稳定的百分比误差)
+    if valid_metrics_history:
+        delta_smape_test = [m.get('delta_smape', 0) for m in test_metrics_history]
+        final_smape_test = [m.get('final_smape', 0) for m in test_metrics_history]
+        
+        axes[1, 2].plot(epochs, delta_smape_test, 'purple', label='Delta SMAPE (%)', linewidth=2)
+        axes[1, 2].plot(epochs, final_smape_test, 'orange', label='Final SMAPE (%)', linewidth=2)
+        axes[1, 2].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7)
+        axes[1, 2].set_xlabel('Epoch')
+        axes[1, 2].set_ylabel('SMAPE (%)')
+        axes[1, 2].set_title('Symmetric Mean Absolute Percentage Error')
+        axes[1, 2].legend()
+        axes[1, 2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plot_path = os.path.join(output_dir, f'e2e_differential_{args.target_metric}.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # 上传图片到SwanLab
+    swanlab.log({"training_curves": swanlab.Image(plot_path)})
+    
+    # 完成实验
+    swanlab.finish()
+    
+    print(f"结果保存在: {output_dir}")
+    print(f"SwanLab实验: HLS-Differential-Learning")
+
+
+if __name__ == "__main__":
+    main() 
