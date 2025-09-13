@@ -341,7 +341,6 @@ class FilteredDataset(InMemoryDataset):
         self.data, self.slices = self.collate(data_list)
         # Copy important attributes from original dataset
         self.num_tasks = original_dataset.num_tasks
-        self.task_type = original_dataset.task_type
         self.eval_metric = original_dataset.eval_metric
         
         # Random split instead of sequential
@@ -380,7 +379,7 @@ def filter_dataset(dataset, max_nodes: int, max_edges: int):
 # Training Module
 # ============================================================================
 
-def train_batch(model, batch, optimizer, task_type, scaler=None):
+def train_batch(model, batch, optimizer, scaler=None):
     """Process training logic for a single batch"""
     # Check for shape mismatch
     pred = model(batch)
@@ -393,12 +392,8 @@ def train_batch(model, batch, optimizer, task_type, scaler=None):
     pred = pred.to(torch.float32)[is_labeled]
     target = batch.y.to(torch.float32)[is_labeled]
     
-    if "regression" in task_type:
-        loss = reg_criterion(pred, target)
-    elif "classification" in task_type:
-        loss = cls_criterion(pred, target)
-    else:
-        raise ValueError(f"Unsupported task type: {task_type}")
+    # Unified regression loss
+    loss = reg_criterion(pred, target)
     
     # Store loss value before clearing variables
     loss_value = loss.item()
@@ -427,7 +422,7 @@ def eval_batch(model, batch, evaluator, y_true, y_pred):
     del pred
 
 
-def train_epoch(model, device, loader, optimizer, task_type, scaler=None):
+def train_epoch(model, device, loader, optimizer, scaler=None):
     """Train model for one epoch"""
     model.train()
     total_loss = 0
@@ -443,7 +438,7 @@ def train_epoch(model, device, loader, optimizer, task_type, scaler=None):
         if batch.x.shape[0] == 1 or (batch.batch.shape[0] > 0 and batch.batch[-1] == 0):
             pass
         else:
-            loss = train_batch(model, batch, optimizer, task_type, scaler)
+            loss = train_batch(model, batch, optimizer, scaler)
             if loss is not None:
                 total_loss += loss
                 batch_count += 1
@@ -499,8 +494,8 @@ def evaluate_model(model, device, loader, evaluator):
 # Visualization Module
 # ============================================================================
 
-def save_comprehensive_training_plots(train_loss_curve, train_curve, valid_curve, test_curve, 
-                                    learning_rate_curve, mape_curve=None, task_type="regression", 
+def save_comprehensive_training_plots(train_loss_curve, train_curve, valid_curve, test_curve,
+                                    learning_rate_curve, mape_curve=None,
                                     eval_metric="rmse", output_dir="./output"):
     """Create comprehensive training visualization with all important curves"""
     # Determine the number of subplots based on available data
@@ -525,10 +520,8 @@ def save_comprehensive_training_plots(train_loss_curve, train_curve, valid_curve
     ax2.plot(epochs, test_curve, 'r-', linewidth=2, label=f'Test {eval_metric.upper()}')
     
     # Mark best validation epoch
-    if "classification" in task_type:
-        best_epoch = np.argmax(np.array(valid_curve))
-    else:
-        best_epoch = np.argmin(np.array(valid_curve))
+    # For regression (lower is better)
+    best_epoch = np.argmin(np.array(valid_curve))
     
     ax2.axvline(x=best_epoch+1, color='purple', linestyle='--', alpha=0.7, 
                 label=f'Best Valid (Epoch {best_epoch+1})')
@@ -553,7 +546,7 @@ def save_comprehensive_training_plots(train_loss_curve, train_curve, valid_curve
     
     # Plot 4: MAPE Curve or Overfitting Analysis
     ax4 = axes[1, 1]
-    if mape_curve is not None and "regression" in task_type:
+    if mape_curve is not None:
         epochs = range(1, len(mape_curve) + 1)
         ax4.plot(epochs, mape_curve, 'purple', linewidth=2, label='Test MAPE (%)')
         ax4.axvline(x=best_epoch+1, color='red', linestyle='--', alpha=0.7, 
@@ -571,10 +564,8 @@ def save_comprehensive_training_plots(train_loss_curve, train_curve, valid_curve
             valid_smooth = np.convolve(valid_curve, np.ones(5)/5, mode='valid')
             epochs_smooth = range(3, len(train_smooth) + 3)
             
-            # Calculate gap between train and validation
+            # Calculate gap between train and validation (regression)
             gap = np.array(valid_smooth) - np.array(train_smooth)
-            if "classification" in task_type:
-                gap = -gap
             
             ax4.plot(epochs_smooth, gap, 'red', linewidth=2, label='Valid-Train Gap')
             ax4.axhline(y=0, color='black', linestyle='-', alpha=0.5)
@@ -728,9 +719,6 @@ class GNNTrainer:
         dataset_info = {
             "name": self.args.dataset,
             "feature_mode": self.args.feature,
-            "num_tasks": self.dataset.num_tasks,
-            "task_type": self.dataset.task_type,
-            "eval_metric": self.dataset.eval_metric,
             "train_size": len(self.split_idx['train']),
             "valid_size": len(self.split_idx['valid']),
             "test_size": len(self.split_idx['test']),
@@ -756,7 +744,8 @@ class GNNTrainer:
         
         # Setup scheduler
         scheduler_config = get_scheduler_config()
-        scheduler_mode = 'min' if 'regression' in self.dataset.task_type else 'max'
+        # Regression: lower is better
+        scheduler_mode = 'min'
         self.scheduler = ReduceLROnPlateau(
             self.optimizer, 
             mode=scheduler_mode, 
@@ -819,7 +808,7 @@ class GNNTrainer:
         
         # Training phase
         print('Training phase...')
-        epoch_loss = train_epoch(self.model, self.device, self.train_loader, self.optimizer, self.dataset.task_type)
+        epoch_loss = train_epoch(self.model, self.device, self.train_loader, self.optimizer)
         self.train_loss_curve.append(epoch_loss)
         
         # Evaluation phase
@@ -829,31 +818,28 @@ class GNNTrainer:
             valid_perf, v_true, v_pred = evaluate_model(self.model, self.device, self.valid_loader, self.evaluator)
             test_perf, t_true, t_pred = evaluate_model(self.model, self.device, self.test_loader, self.evaluator)
         
-        # Calculate MAPE for regression tasks
-        if 'classification' not in self.dataset.task_type:
-            train_true_list = reduce(operator.add, train_true.tolist())
-            train_pred_list = reduce(operator.add, train_pred.tolist())
-            train_mape = calculate_mape(train_true_list, train_pred_list)
-            train_perf['mape'] = train_mape
+        # Calculate and log MAPE (regression)
+        train_true_list = reduce(operator.add, train_true.tolist())
+        train_pred_list = reduce(operator.add, train_pred.tolist())
+        train_mape = calculate_mape(train_true_list, train_pred_list)
+        train_perf['mape'] = train_mape
 
-            valid_true_list = reduce(operator.add, v_true.tolist())
-            valid_pred_list = reduce(operator.add, v_pred.tolist())
-            valid_mape = calculate_mape(valid_true_list, valid_pred_list)
-            valid_perf['mape'] = valid_mape
+        valid_true_list = reduce(operator.add, v_true.tolist())
+        valid_pred_list = reduce(operator.add, v_pred.tolist())
+        valid_mape = calculate_mape(valid_true_list, valid_pred_list)
+        valid_perf['mape'] = valid_mape
 
-            test_true_list = reduce(operator.add, t_true.tolist())
-            test_pred_list = reduce(operator.add, t_pred.tolist())
-            test_mape = calculate_mape(test_true_list, test_pred_list)
-            test_perf['mape'] = test_mape
-            
-            # Record MAPE for curve plotting
-            self.mape_curve.append(test_mape)
+        test_true_list = reduce(operator.add, t_true.tolist())
+        test_pred_list = reduce(operator.add, t_pred.tolist())
+        test_mape = calculate_mape(test_true_list, test_pred_list)
+        test_perf['mape'] = test_mape
+        
+        # Record MAPE for curve plotting
+        self.mape_curve.append(test_mape)
 
-            print({'Train': {'rmse': train_perf[self.dataset.eval_metric], 'mape': f'{train_mape:.2f}%'},
-                   'Validation': {'rmse': valid_perf[self.dataset.eval_metric], 'mape': f'{valid_mape:.2f}%'},
-                   'Test': {'rmse': test_perf[self.dataset.eval_metric], 'mape': f'{test_mape:.2f}%'}})
-        else:
-            print({'Train': train_perf, 'Validation': valid_perf, 'Test': test_perf})
+        print({'Train': {'rmse': train_perf[self.dataset.eval_metric], 'mape': f'{train_mape:.2f}%'},
+               'Validation': {'rmse': valid_perf[self.dataset.eval_metric], 'mape': f'{valid_mape:.2f}%'},
+               'Test': {'rmse': test_perf[self.dataset.eval_metric], 'mape': f'{test_mape:.2f}%'}})
         
         # Record curves
         self.train_curve.append(train_perf[self.dataset.eval_metric])
@@ -891,17 +877,13 @@ class GNNTrainer:
     
     def _is_best_epoch(self):
         """Check if current epoch is the best based on validation performance"""
-        if 'classification' in self.dataset.task_type:
-            return self.valid_curve[-1] >= max(self.valid_curve)
-        else:
-            return self.valid_curve[-1] <= min(self.valid_curve)
+        # Regression: lower is better
+        return self.valid_curve[-1] <= min(self.valid_curve)
     
     def _get_best_epoch_idx(self):
         """Get the index of the best epoch"""
-        if 'classification' in self.dataset.task_type:
-            return np.argmax(np.array(self.valid_curve))
-        else:
-            return np.argmin(np.array(self.valid_curve))
+        # Regression: lower is better
+        return np.argmin(np.array(self.valid_curve))
     
     def _save_best_model(self, epoch, valid_perf, train_true, train_pred, v_true, v_pred, t_true, t_pred):
         """Save the best model checkpoint and predictions"""
@@ -954,26 +936,24 @@ class GNNTrainer:
             }
         }
         
-        # Add MAPE results for regression
-        if 'classification' not in self.dataset.task_type:
-            if hasattr(self, 'best_test_pred') and hasattr(self, 'final_test_true'):
-                if self.final_test_true and self.best_test_pred:
-                    final_test_mape = calculate_mape(self.final_test_true, self.best_test_pred)
-                    result['metrics']['test_mape'] = final_test_mape
-                    print(f'Final test MAPE: {final_test_mape:.2f}%')
-                    
-                    # Calculate error statistics
-                    errors = [abs(pred - true) for pred, true in zip(self.best_test_pred, self.final_test_true)]
-                    result['error_stats'] = {
-                        'min': min(errors),
-                        'max': max(errors),
-                        'mean': sum(errors) / len(errors),
-                        'median': sorted(errors)[len(errors) // 2],
-                        'percentile_90': sorted(errors)[int(len(errors) * 0.9)]
-                    }
-            
-            # Add MAPE curve to results
-            result['curves']['mape'] = self.mape_curve
+        # Add MAPE results and error stats (regression)
+        if hasattr(self, 'best_test_pred') and hasattr(self, 'final_test_true'):
+            if self.final_test_true and self.best_test_pred:
+                final_test_mape = calculate_mape(self.final_test_true, self.best_test_pred)
+                result['metrics']['test_mape'] = final_test_mape
+                print(f'Final test MAPE: {final_test_mape:.2f}%')
+                
+                # Calculate error statistics
+                errors = [abs(pred - true) for pred, true in zip(self.best_test_pred, self.final_test_true)]
+                result['error_stats'] = {
+                    'min': min(errors),
+                    'max': max(errors),
+                    'mean': sum(errors) / len(errors),
+                    'median': sorted(errors)[len(errors) // 2],
+                    'percentile_90': sorted(errors)[int(len(errors) * 0.9)]
+                }
+        # Add MAPE curve to results
+        result['curves']['mape'] = self.mape_curve
         
         # Save results JSON
         results_path = os.path.join(self.args.output_dir, 'training_results.json')
@@ -988,8 +968,7 @@ class GNNTrainer:
             valid_curve=self.valid_curve, 
             test_curve=self.test_curve,
             learning_rate_curve=self.learning_rate_curve,
-            mape_curve=self.mape_curve if 'classification' not in self.dataset.task_type and self.mape_curve else None,
-            task_type=self.dataset.task_type,
+            mape_curve=self.mape_curve if self.mape_curve else None,
             eval_metric=self.dataset.eval_metric,
             output_dir=self.args.output_dir
         )
@@ -1004,7 +983,7 @@ class GNNTrainer:
             'train_score': self.train_curve[best_val_epoch]
         }
         
-        if 'classification' not in self.dataset.task_type and hasattr(self, 'best_test_pred') and hasattr(self, 'final_test_true'):
+        if hasattr(self, 'best_test_pred') and hasattr(self, 'final_test_true'):
             if self.final_test_true and self.best_test_pred:
                 final_test_mape = calculate_mape(self.final_test_true, self.best_test_pred)
                 best_metrics['test_mape'] = f"{final_test_mape:.2f}%"

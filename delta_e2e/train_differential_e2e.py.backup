@@ -11,7 +11,6 @@ Paths:
 - Kernel: /home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/Graphs/forgehls_kernels/kernels/source_name/algo_name/
 
 Author: Zedong Peng
-Date: 2025-01-XX
 """
 
 import torch
@@ -44,6 +43,21 @@ from pre_process_forgehls import (
     parse_xml_into_graph_single, node_to_feature_vector, edge_to_feature_vector,
     get_node_feature_dims, get_edge_feature_dims
 )
+
+# 简化的归一化因子
+DSP_NORM = 100.0
+LUT_NORM = 10000.0
+FF_NORM = 10000.0
+LATENCY_NORM = 100.0
+
+# 可用资源数量（用于计算ulti-RMSE）
+AVAILABLE_RESOURCES = {
+    'dsp': 9024,
+    'lut': 1303680,
+    'ff': 2607360,
+    'bram_18k': 4032,
+    'uram': 960
+}
 
 
 # ============================================================================
@@ -118,7 +132,7 @@ class E2EDifferentialProcessor:
                 algo_name = algo_dir.name
                 
                 # 查找对应的kernel
-                kernel_path = kernel_base / "kernels" / source_name / algo_name
+                kernel_path = kernel_base / source_name / algo_name
                 if not kernel_path.exists():
                     continue
                 
@@ -354,10 +368,11 @@ class E2EDifferentialProcessor:
             ]):
                 return None
             
-            # 计算性能差值
+            # 获取性能数据
             k_perf = kernel_data['performance']
             d_perf = design_data['performance']
             
+            # 计算性能差值（不归一化，保持原始值）
             performance_delta = {
                 'latency_delta': d_perf['best_latency'] - k_perf['best_latency'],
                 'dsp_delta': d_perf['DSP'] - k_perf['DSP'],
@@ -365,23 +380,22 @@ class E2EDifferentialProcessor:
                 'ff_delta': d_perf['FF'] - k_perf['FF']
             }
             
-            # 添加性能标签到图数据
+            # 添加性能标签到图数据 - 使用简化的归一化
             kernel_graph = kernel_data['graph']
             design_graph = design_data['graph']
             
-            # 创建性能标签 [DSP/100, LUT/10000, FF/10000, latency/100]
             kernel_graph.y = torch.tensor([
-                k_perf['DSP'] / 100.0,
-                k_perf['LUT'] / 10000.0,
-                k_perf['FF'] / 10000.0,
-                k_perf['best_latency'] / 100.0
+                k_perf['DSP'] / DSP_NORM,
+                k_perf['LUT'] / LUT_NORM,
+                k_perf['FF'] / FF_NORM,
+                k_perf['best_latency'] / LATENCY_NORM
             ], dtype=torch.float).unsqueeze(0)
             
             design_graph.y = torch.tensor([
-                d_perf['DSP'] / 100.0,
-                d_perf['LUT'] / 10000.0,
-                d_perf['FF'] / 10000.0,
-                d_perf['best_latency'] / 100.0
+                d_perf['DSP'] / DSP_NORM,
+                d_perf['LUT'] / LUT_NORM,
+                d_perf['FF'] / FF_NORM,
+                d_perf['best_latency'] / LATENCY_NORM
             ], dtype=torch.float).unsqueeze(0)
             
             return {
@@ -504,14 +518,6 @@ class SimpleDifferentialGNN(nn.Module):
             nn.Linear(hidden_dim // 2, 1)
         )
         
-        # 基线预测头
-        self.baseline_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-        
         # 指标索引映射
         self.metric_idx = {'dsp': 0, 'lut': 1, 'ff': 2, 'latency': 3}[target_metric]
         
@@ -538,7 +544,7 @@ class SimpleDifferentialGNN(nn.Module):
         return global_mean_pool(x, batch)
     
     def forward(self, kernel_graph, design_graph, pragma_count):
-        """前向传播"""
+        """前向传播 - 只预测差值"""
         # 编码图
         kernel_repr = self.encode_graph(kernel_graph)
         design_repr = self.encode_graph(design_graph)
@@ -546,20 +552,12 @@ class SimpleDifferentialGNN(nn.Module):
         # Pragma嵌入 - 暂时注释掉
         # pragma_emb = self.pragma_embedding(pragma_count.clamp(0, 49))
         
-        # 预测基线（kernel性能）
-        baseline_pred = self.baseline_head(kernel_repr)
-        
-        # 预测差值
+        # 只预测差值
         combined = torch.cat([kernel_repr, design_repr], dim=-1) 
         delta_pred = self.delta_head(combined)
         
-        # 最终预测
-        final_pred = baseline_pred + delta_pred
-        
         return {
-            'baseline_pred': baseline_pred,
-            'delta_pred': delta_pred,
-            'final_pred': final_pred
+            'delta_pred': delta_pred
         }
 
 
@@ -663,13 +661,27 @@ def train_epoch(model, device, train_loader, optimizer):
             'performance_delta': batch['performance_delta'].to(device)
         }
         
-        # 多任务损失 - 修复维度不匹配问题
-        baseline_loss = F.mse_loss(predictions['baseline_pred'].squeeze(), targets['kernel_perf'].squeeze())
-        delta_loss = F.mse_loss(predictions['delta_pred'].squeeze(), targets['performance_delta'].squeeze())
-        final_loss = F.mse_loss(predictions['final_pred'].squeeze(), targets['design_perf'].squeeze())
+        # 获取目标指标的归一化因子
+        target_metric = getattr(model, 'target_metric', 'dsp')
+        if target_metric == 'dsp':
+            norm_factor = DSP_NORM
+        elif target_metric == 'lut':
+            norm_factor = LUT_NORM
+        elif target_metric == 'ff':
+            norm_factor = FF_NORM
+        elif target_metric == 'latency':
+            norm_factor = LATENCY_NORM
+        else:
+            norm_factor = DSP_NORM
         
-        # 组合损失
-        total_batch_loss = 0.3 * baseline_loss + 0.5 * delta_loss + 0.2 * final_loss
+        # 归一化差值目标值
+        normalized_delta = targets['performance_delta'].squeeze() / norm_factor
+        
+        # 计算归一化空间的差值损失
+        delta_loss = F.l1_loss(predictions['delta_pred'].squeeze(), normalized_delta)
+        
+        # 只使用差值损失
+        total_batch_loss = delta_loss
         
         # 反向传播 - 添加梯度裁剪
         total_batch_loss.backward()
@@ -682,16 +694,14 @@ def train_epoch(model, device, train_loader, optimizer):
     return total_loss / batch_count if batch_count > 0 else float('inf')
 
 
-def evaluate_model(model, device, data_loader):
-    """评估模型"""
+def evaluate_model(model, data_loader, device, target_metric='dsp', return_predictions=False):
+    """评估模型性能 - 只评估差值"""
     model.eval()
     total_loss = 0
     batch_count = 0
     
     all_delta_preds = []
     all_delta_true = []
-    all_final_preds = []
-    all_final_true = []
     
     with torch.no_grad():
         for batch in data_loader:
@@ -710,20 +720,32 @@ def evaluate_model(model, device, data_loader):
                 'performance_delta': batch['performance_delta'].to(device)
             }
             
-            # 计算损失 - 修复维度不匹配问题
-            baseline_loss = F.mse_loss(predictions['baseline_pred'].squeeze(), targets['kernel_perf'].squeeze())
-            delta_loss = F.mse_loss(predictions['delta_pred'].squeeze(), targets['performance_delta'].squeeze())
-            final_loss = F.mse_loss(predictions['final_pred'].squeeze(), targets['design_perf'].squeeze())
-            total_batch_loss = 0.3 * baseline_loss + 0.5 * delta_loss + 0.2 * final_loss
+            # 获取目标指标的归一化因子
+            target_metric = getattr(model, 'target_metric', 'dsp')
+            if target_metric == 'dsp':
+                norm_factor = DSP_NORM
+            elif target_metric == 'lut':
+                norm_factor = LUT_NORM
+            elif target_metric == 'ff':
+                norm_factor = FF_NORM
+            elif target_metric == 'latency':
+                norm_factor = LATENCY_NORM
+            else:
+                norm_factor = DSP_NORM
+            
+            # 归一化差值目标值
+            normalized_delta = targets['performance_delta'].squeeze() / norm_factor
+            
+            # 计算归一化空间的差值损失
+            delta_loss = F.l1_loss(predictions['delta_pred'].squeeze(), normalized_delta)
+            total_batch_loss = delta_loss
             
             total_loss += total_batch_loss.item()
             batch_count += 1
             
-            # 收集预测结果
+            # 收集差值预测结果（预测值已归一化，真实值需要归一化）
             all_delta_preds.append(predictions['delta_pred'].cpu())
-            all_delta_true.append(targets['performance_delta'].cpu())
-            all_final_preds.append(predictions['final_pred'].cpu())
-            all_final_true.append(targets['design_perf'].cpu())
+            all_delta_true.append((targets['performance_delta'].cpu() / norm_factor))
     
     # 计算评估指标
     avg_loss = total_loss / batch_count if batch_count > 0 else float('inf')
@@ -731,89 +753,83 @@ def evaluate_model(model, device, data_loader):
     if all_delta_preds:
         delta_preds = torch.cat(all_delta_preds, dim=0)
         delta_true = torch.cat(all_delta_true, dim=0)
-        final_preds = torch.cat(all_final_preds, dim=0)
-        final_true = torch.cat(all_final_true, dim=0)
         
-        # 计算指标 - 修复维度不匹配问题
-        delta_rmse = torch.sqrt(F.mse_loss(delta_preds.squeeze(), delta_true.squeeze())).item()
-        delta_mae = F.l1_loss(delta_preds.squeeze(), delta_true.squeeze()).item()
-        final_rmse = torch.sqrt(F.mse_loss(final_preds.squeeze(), final_true.squeeze())).item()
-        final_mae = F.l1_loss(final_preds.squeeze(), final_true.squeeze()).item()
+        # 计算差值指标 - 使用简化的归一化因子
+        target_metric = getattr(model, 'target_metric', 'dsp')
         
-        # MAPE和SMAPE计算 - 修复维度问题
+        # 直接获取归一化因子
+        if target_metric == 'dsp':
+            norm_factor = DSP_NORM
+        elif target_metric == 'lut':
+            norm_factor = LUT_NORM
+        elif target_metric == 'ff':
+            norm_factor = FF_NORM
+        elif target_metric == 'latency':
+            norm_factor = LATENCY_NORM
+        else:
+            norm_factor = DSP_NORM  # 默认使用DSP
+        
+        # 计算归一化空间的MAE和RMSE（数据已经归一化）
+        delta_mae_norm = F.l1_loss(delta_preds.squeeze(), delta_true.squeeze()).item()
+        delta_rmse_norm = torch.sqrt(F.mse_loss(delta_preds.squeeze(), delta_true.squeeze())).item()
+        
+        # 恢复到真实资源单位的MAE和RMSE
+        delta_mae = delta_mae_norm * norm_factor
+        delta_rmse = delta_rmse_norm * norm_factor
+        
+        # 计算ulti-RMSE (actual-RMSE / available-resource-num)
+        available_resource_num = AVAILABLE_RESOURCES.get(target_metric, AVAILABLE_RESOURCES['dsp'])
+        delta_ulti_rmse = delta_rmse / available_resource_num
+        
+        # 计算R2指标 - 修复维度问题
         delta_true_sq = delta_true.squeeze()
         delta_preds_sq = delta_preds.squeeze()
-        final_true_sq = final_true.squeeze()
-        final_preds_sq = final_preds.squeeze()
         
-        # MAPE (避免除零)
-        delta_mape = torch.mean(torch.abs((delta_true_sq - delta_preds_sq) / (torch.abs(delta_true_sq) + 1e-8))).item() * 100
-        final_mape = torch.mean(torch.abs((final_true_sq - final_preds_sq) / (torch.abs(final_true_sq) + 1e-8))).item() * 100
+        # R2 (决定系数) - 只计算差值的R2
+        def calculate_r2(y_true, y_pred):
+            ss_res = torch.sum((y_true - y_pred) ** 2)
+            ss_tot = torch.sum((y_true - torch.mean(y_true)) ** 2)
+            return (1 - ss_res / (ss_tot + 1e-8)).item()
         
-        # SMAPE (对称平均绝对百分比误差)
-        delta_smape = torch.mean(2 * torch.abs(delta_true_sq - delta_preds_sq) / (torch.abs(delta_true_sq) + torch.abs(delta_preds_sq) + 1e-8)).item() * 100
-        final_smape = torch.mean(2 * torch.abs(final_true_sq - final_preds_sq) / (torch.abs(final_true_sq) + torch.abs(final_preds_sq) + 1e-8)).item() * 100
+        delta_r2 = calculate_r2(delta_true_sq, delta_preds_sq)
         
         metrics_dict = {
             'avg_loss': avg_loss,
-            'delta_rmse': delta_rmse,
             'delta_mae': delta_mae,
-            'delta_mape': delta_mape,
-            'delta_smape': delta_smape,
-            'final_rmse': final_rmse,
-            'final_mae': final_mae,
-            'final_mape': final_mape,
-            'final_smape': final_smape
+            'delta_rmse': delta_rmse,
+            'delta_ulti_rmse': delta_ulti_rmse,
+            'delta_r2': delta_r2
         }
         
         # 只在需要时添加tensor数据（用于散点图）
         if len(delta_preds_sq) > 0:
             metrics_dict.update({
                 'delta_preds': delta_preds_sq,
-                'delta_true': delta_true_sq,
-                'final_preds': final_preds_sq,
-                'final_true': final_true_sq
+                'delta_true': delta_true_sq
             })
         
         return metrics_dict
     
-    return {'avg_loss': avg_loss}
+    return {'avg_loss': avg_loss, 'delta_mae': 0, 'delta_rmse': 0, 'delta_ulti_rmse': 0, 'delta_r2': 0}
 
 
 def _create_prediction_plots(test_metrics: Dict, target_metric: str, output_dir: str):
-    """创建预测vs真实值散点图"""
+    """创建差值预测vs真实值散点图"""
     delta_true = test_metrics['delta_true'].cpu().numpy()
     delta_preds = test_metrics['delta_preds'].cpu().numpy()
-    final_true = test_metrics['final_true'].cpu().numpy()
-    final_preds = test_metrics['final_preds'].cpu().numpy()
-    
-    # 创建子图
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-    fig.suptitle(f'Prediction vs Ground Truth - {target_metric.upper()}', fontsize=16)
     
     # 差值预测散点图
-    axes[0].scatter(delta_true, delta_preds, alpha=0.6, s=50)
+    plt.figure(figsize=(8, 6))
+    plt.scatter(delta_true, delta_preds, alpha=0.6, s=50)
     min_val = min(delta_true.min(), delta_preds.min())
     max_val = max(delta_true.max(), delta_preds.max())
-    axes[0].plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8, linewidth=2, label='Perfect Prediction')
-    axes[0].set_xlabel(f'True Delta {target_metric.upper()}')
-    axes[0].set_ylabel(f'Predicted Delta {target_metric.upper()}')
-    axes[0].set_title(f'Performance Delta Prediction (Δ{target_metric.upper()})')
-    axes[0].legend()
-    axes[0].grid(True, alpha=0.3)
+    plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8, linewidth=2, label='Perfect Prediction')
+    plt.xlabel(f'True Delta {target_metric.upper()} (Real Resource Units)')
+    plt.ylabel(f'Predicted Delta {target_metric.upper()} (Real Resource Units)')
+    plt.title(f'Performance Delta Prediction (Δ{target_metric.upper()}) - Real Resource Scale')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
     
-    # 最终性能预测散点图
-    axes[1].scatter(final_true, final_preds, alpha=0.6, s=50, color='orange')
-    min_val = min(final_true.min(), final_preds.min())
-    max_val = max(final_true.max(), final_preds.max())
-    axes[1].plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8, linewidth=2, label='Perfect Prediction')
-    axes[1].set_xlabel(f'True Final {target_metric.upper()}')
-    axes[1].set_ylabel(f'Predicted Final {target_metric.upper()}')
-    axes[1].set_title(f'Final Performance Prediction ({target_metric.upper()})')
-    axes[1].legend()
-    axes[1].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
     scatter_path = os.path.join(output_dir, f'prediction_scatter_{target_metric}.png')
     plt.savefig(scatter_path, dpi=300, bbox_inches='tight')
     plt.close()
@@ -847,15 +863,19 @@ def main():
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout率')
     
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=8, help='批大小')
+    parser.add_argument('--batch_size', type=int, default=32, help='批大小')
     parser.add_argument('--lr', type=float, default=0.001, help='学习率')
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
     parser.add_argument('--device', type=int, default=0, help='GPU设备ID')
     
-    # 输出参数
-    parser.add_argument('--output_dir', type=str, default='./differential_output_e2e', help='输出目录')
+    # 输出与缓存参数（统一到项目 GNN 目录下，不受当前工作目录影响）
+    project_root = Path(__file__).resolve().parents[1]  # 指向 GNN 目录
+    default_output_dir = str(project_root / 'differential_output_e2e')
+    default_cache_root = str(project_root / 'graph_cache')
+
+    parser.add_argument('--output_dir', type=str, default=default_output_dir, help='输出目录')
     # 缓存参数
-    parser.add_argument('--cache_root', type=str, default='./graph_cache', help='图数据缓存根目录')
+    parser.add_argument('--cache_root', type=str, default=default_cache_root, help='图数据缓存根目录')
     parser.add_argument('--rebuild_cache', action='store_true', help='忽略已有缓存并重新构建')
     
     # 调试参数
@@ -1006,13 +1026,13 @@ def main():
         train_losses.append(train_loss)
         
         # 验证
-        valid_metrics = evaluate_model(model, device, valid_loader)
+        valid_metrics = evaluate_model(model, valid_loader, device, args.target_metric)
         valid_loss = valid_metrics['avg_loss']
         valid_losses.append(valid_loss)
         valid_metrics_history.append(valid_metrics)
         
         # 测试
-        test_metrics = evaluate_model(model, device, test_loader)
+        test_metrics = evaluate_model(model, test_loader, device, args.target_metric)
         test_loss = test_metrics['avg_loss']
         test_losses.append(test_loss)
         test_metrics_history.append(test_metrics)
@@ -1026,17 +1046,15 @@ def main():
             "epoch": epoch,
             "train/loss": train_loss,
             "valid/loss": valid_loss,
+            "valid/delta_mae": valid_metrics.get('delta_mae', 0),
             "valid/delta_rmse": valid_metrics.get('delta_rmse', 0),
-            "valid/delta_mape": valid_metrics.get('delta_mape', 0),
-            "valid/delta_smape": valid_metrics.get('delta_smape', 0),
-            "valid/final_rmse": valid_metrics.get('final_rmse', 0),
+            "valid/delta_ulti_rmse": valid_metrics.get('delta_ulti_rmse', 0),
+            "valid/delta_r2": valid_metrics.get('delta_r2', 0),
             "test/loss": test_loss,
+            "test/delta_mae": test_metrics.get('delta_mae', 0),
             "test/delta_rmse": test_metrics.get('delta_rmse', 0),
-            "test/delta_mape": test_metrics.get('delta_mape', 0),
-            "test/delta_smape": test_metrics.get('delta_smape', 0),
-            "test/final_rmse": test_metrics.get('final_rmse', 0),
-            "test/final_mape": test_metrics.get('final_mape', 0),
-            "test/final_smape": test_metrics.get('final_smape', 0),
+            "test/delta_ulti_rmse": test_metrics.get('delta_ulti_rmse', 0),
+            "test/delta_r2": test_metrics.get('delta_r2', 0),
             "optimizer/lr": current_lr
         })
         
@@ -1067,12 +1085,10 @@ def main():
         swanlab.log({
             "final/best_epoch": best_epoch,
             "final/best_valid_loss": best_valid_loss,
+            "final/delta_mae": best_test.get('delta_mae', 0),
             "final/delta_rmse": best_test.get('delta_rmse', 0),
-            "final/delta_mape": best_test.get('delta_mape', 0),
-            "final/delta_smape": best_test.get('delta_smape', 0),
-            "final/final_rmse": best_test.get('final_rmse', 0),
-            "final/final_mape": best_test.get('final_mape', 0),
-            "final/final_smape": best_test.get('final_smape', 0)
+            "final/delta_ulti_rmse": best_test.get('delta_ulti_rmse', 0),
+            "final/delta_r2": best_test.get('delta_r2', 0)
         })
         
         # 创建最佳epoch的预测vs真实散点图
@@ -1080,9 +1096,11 @@ def main():
             _create_prediction_plots(best_test, args.target_metric, output_dir)
         
         print(f"训练完成! 最佳模型 ({args.target_metric.upper()}):")
-        print(f"  Epoch: {best_epoch}, 差值RMSE: {best_test.get('delta_rmse', 0):.6f}")
-        print(f"  差值MAPE: {best_test.get('delta_mape', 0):.2f}%, SMAPE: {best_test.get('delta_smape', 0):.2f}%")
-        print(f"  最终RMSE: {best_test.get('final_rmse', 0):.6f}")
+        print(f"  Epoch: {best_epoch}")
+        print(f"  差值MAE: {best_test.get('delta_mae', 0):.6f}")
+        print(f"  差值RMSE: {best_test.get('delta_rmse', 0):.6f}")
+        print(f"  差值ulti-RMSE: {best_test.get('delta_ulti_rmse', 0):.8f}")
+        print(f"  差值R²: {best_test.get('delta_r2', 0):.4f}")
     
     # 保存训练历史 - 清理tensor数据避免JSON序列化错误
     clean_valid_history = []
@@ -1128,59 +1146,57 @@ def main():
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
     
+    # 差值MAE
+    if valid_metrics_history:
+        delta_mae_valid = [m.get('delta_mae', 0) for m in valid_metrics_history]
+        delta_mae_test = [m.get('delta_mae', 0) for m in test_metrics_history]
+        
+        axes[0, 1].plot(epochs, delta_mae_valid, 'orange', label='Valid Delta MAE', linewidth=2)
+        axes[0, 1].plot(epochs, delta_mae_test, 'purple', label='Test Delta MAE', linewidth=2)
+        axes[0, 1].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7)
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Delta MAE')
+        axes[0, 1].set_title('Performance Delta Prediction')
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, alpha=0.3)
+    
     # 差值RMSE
     if valid_metrics_history:
         delta_rmse_valid = [m.get('delta_rmse', 0) for m in valid_metrics_history]
         delta_rmse_test = [m.get('delta_rmse', 0) for m in test_metrics_history]
         
-        axes[0, 1].plot(epochs, delta_rmse_valid, 'orange', label='Valid Delta RMSE', linewidth=2)
-        axes[0, 1].plot(epochs, delta_rmse_test, 'purple', label='Test Delta RMSE', linewidth=2)
-        axes[0, 1].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7)
-        axes[0, 1].set_xlabel('Epoch')
-        axes[0, 1].set_ylabel('Delta RMSE')
-        axes[0, 1].set_title('Performance Delta Prediction')
-        axes[0, 1].legend()
-        axes[0, 1].grid(True, alpha=0.3)
-    
-    # 最终性能RMSE
-    if valid_metrics_history:
-        final_rmse_valid = [m.get('final_rmse', 0) for m in valid_metrics_history]
-        final_rmse_test = [m.get('final_rmse', 0) for m in test_metrics_history]
-        
-        axes[1, 0].plot(epochs, final_rmse_valid, 'cyan', label='Valid Final RMSE', linewidth=2)
-        axes[1, 0].plot(epochs, final_rmse_test, 'magenta', label='Test Final RMSE', linewidth=2)
+        axes[1, 0].plot(epochs, delta_rmse_valid, 'cyan', label='Valid Delta RMSE', linewidth=2)
+        axes[1, 0].plot(epochs, delta_rmse_test, 'magenta', label='Test Delta RMSE', linewidth=2)
         axes[1, 0].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7)
         axes[1, 0].set_xlabel('Epoch')
-        axes[1, 0].set_ylabel('Final RMSE')
-        axes[1, 0].set_title('Final Performance Prediction')
+        axes[1, 0].set_ylabel('Delta RMSE')
+        axes[1, 0].set_title('Delta Root Mean Square Error')
         axes[1, 0].legend()
         axes[1, 0].grid(True, alpha=0.3)
     
-    # MAPE曲线
+    # 差值R2曲线
     if valid_metrics_history:
-        delta_mape_test = [m.get('delta_mape', 0) for m in test_metrics_history]
-        final_mape_test = [m.get('final_mape', 0) for m in test_metrics_history]
+        delta_r2_valid = [m.get('delta_r2', 0) for m in valid_metrics_history]
+        delta_r2_test = [m.get('delta_r2', 0) for m in test_metrics_history]
         
-        axes[1, 1].plot(epochs, delta_mape_test, 'brown', label='Delta MAPE (%)', linewidth=2)
-        axes[1, 1].plot(epochs, final_mape_test, 'pink', label='Final MAPE (%)', linewidth=2)
+        axes[1, 1].plot(epochs, delta_r2_valid, 'brown', label='Valid Delta R²', linewidth=2)
+        axes[1, 1].plot(epochs, delta_r2_test, 'pink', label='Test Delta R²', linewidth=2)
         axes[1, 1].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7)
         axes[1, 1].set_xlabel('Epoch')
-        axes[1, 1].set_ylabel('MAPE (%)')
-        axes[1, 1].set_title('Mean Absolute Percentage Error')
+        axes[1, 1].set_ylabel('R² Score')
+        axes[1, 1].set_title('Delta R² Score')
         axes[1, 1].legend()
         axes[1, 1].grid(True, alpha=0.3)
     
-    # SMAPE曲线 (更稳定的百分比误差)
+    # 学习率曲线
     if valid_metrics_history:
-        delta_smape_test = [m.get('delta_smape', 0) for m in test_metrics_history]
-        final_smape_test = [m.get('final_smape', 0) for m in test_metrics_history]
-        
-        axes[1, 2].plot(epochs, delta_smape_test, 'purple', label='Delta SMAPE (%)', linewidth=2)
-        axes[1, 2].plot(epochs, final_smape_test, 'orange', label='Final SMAPE (%)', linewidth=2)
+        # 简单显示损失对比
+        axes[1, 2].plot(epochs, train_losses, 'blue', label='Train Loss', linewidth=2)
+        axes[1, 2].plot(epochs, valid_losses, 'red', label='Valid Loss', linewidth=2)
         axes[1, 2].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7)
         axes[1, 2].set_xlabel('Epoch')
-        axes[1, 2].set_ylabel('SMAPE (%)')
-        axes[1, 2].set_title('Symmetric Mean Absolute Percentage Error')
+        axes[1, 2].set_ylabel('Loss')
+        axes[1, 2].set_title('Training vs Validation Loss')
         axes[1, 2].legend()
         axes[1, 2].grid(True, alpha=0.3)
     
@@ -1200,4 +1216,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()

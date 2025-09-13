@@ -1,0 +1,32 @@
+# Cursor Rules for HLS Performance Prediction Project
+
+## Environment
+- Use conda environment: `circuitnet`
+- Activate before running any Python scripts: `conda activate circuitnet`
+
+## Python Execution
+- All Python commands should be run with: `conda activate circuitnet && python script.py`
+- For training scripts in GNN/src/, use: `cd GNN/src && conda activate circuitnet && python train_differential_e2e.py`
+
+## Project Structure
+- Main training script: `GNN/src/train_differential_e2e.py`
+- Data paths:
+  - Kernel: `/home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/Graphs/forgehls_kernels/`
+  - Design: `/home/user/zedongpeng/workspace/Huggingface/forgehls_lite_10designs/`
+- Output: `GNN/src/differential_output_e2e/`
+- Graph cache: `GNN/src/graph_cache/`
+
+## Key Features
+- Differential learning: predicts performance delta (design - kernel)
+- Graph caching for efficiency
+- SwanLab integration for experiment tracking
+- Supports metrics: dsp, lut, ff, latency
+
+## Common Commands
+```bash
+# Activate environment and train DSP model
+cd GNN/src && conda activate circuitnet && python train_differential_e2e.py --target_metric dsp --epochs 50
+
+# Train with limited pairs for testing
+cd GNN/src && conda activate circuitnet && python train_differential_e2e.py --target_metric lut --epochs 20 --max_pairs 100
+``` 

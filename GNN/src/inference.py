@@ -30,12 +30,11 @@ import ggnn
 from dataset_pyg import PygGraphPropPredDataset
 from evaluate import Evaluator
 
-cls_criterion = torch.nn.BCEWithLogitsLoss()
 reg_criterion = torch.nn.MSELoss()
 #reg_criterion=torch.nn.SmoothL1Loss(reduction='mean', beta=1.0)
 
 
-def train(model, device, loader, optimizer, task_type):
+def train(model, device, loader, optimizer):
     model.train()
 
     for step, batch in enumerate(tqdm(loader, desc="Iteration")):
@@ -48,10 +47,7 @@ def train(model, device, loader, optimizer, task_type):
             optimizer.zero_grad()
             ## ignore nan targets (unlabeled) when computing training loss.
             is_labeled = batch.y == batch.y
-            if "classification" in task_type: 
-                loss = cls_criterion(pred.to(torch.float32)[is_labeled], batch.y.to(torch.float32)[is_labeled])
-            else:
-                loss = reg_criterion(pred.to(torch.float32)[is_labeled], batch.y.to(torch.float32)[is_labeled])
+            loss = reg_criterion(pred.to(torch.float32)[is_labeled], batch.y.to(torch.float32)[is_labeled])
             loss.backward()
             optimizer.step()
 

@@ -1,0 +1,8 @@
+__pycache__/
+*.pt
+*.png
+*.log
+
+# Generated at runtime; moved to GNN/ by default
+graph_cache/
+differential_output_e2e/

@@ -1,3 +1,4 @@
+from multiprocessing.util import is_abstract_socket_namespace
 import os
 import csv
 import re
@@ -6,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 import concurrent.futures
 import multiprocessing
-
+import tiktoken  # 导入tiktoken库
 def gather_csynth_data(root_dir, output_csv):
     print("Gathering csynth data...")
     # 将路径转换为 Path 对象，便于处理
@@ -23,7 +24,7 @@ def gather_csynth_data(root_dir, output_csv):
             if file == 'csynth.xml':
                 file_path = os.path.join(root, file)
                 csynth_files.append(file_path)
-    
+
     # 并行处理文件
     results = []
     with concurrent.futures.ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
@@ -103,27 +104,39 @@ def base_feature(df):
     df['ResourceMetric'] = (bram_ratio + lut_ratio + dsp_ratio + ff_ratio) / 4
 
     # 提取路径信息 - 使用pandas的str方法代替apply
+    # "File Path":"\/home\/user\/zedongpeng\/workspace\/HLSBatchProcessor\/data\/kernels\/rtl_ip\/dma\/project\/solution1\/syn\/report\/csynth.xml"
     df['File Path'] = df['File Path'].astype(str)
     path_parts = df['File Path'].str.split('/')
     
     # 计算每个路径的长度，以确保我们不会尝试访问不存在的索引
     max_parts = path_parts.str.len().max()
-    
-    # 只有当路径足够长时才提取相应的部分
-    if max_parts >= 6:
-        df['design_id'] = path_parts.str[-6]
-    else:
-        df['design_id'] = 'unknown'
-        
-    if max_parts >= 7:
-        df['algo_name'] = path_parts.str[-7]
-    else:
-        df['algo_name'] = 'unknown'
-        
-    if max_parts >= 8:
-        df['source_name'] = path_parts.str[-8]
-    else:
-        df['source_name'] = 'unknown'
+
+    df['is_kernel'] = 'unknown'  # Default value
+    df.loc[df['File Path'].str.contains('kernels'), 'is_kernel'] = True
+    df.loc[df['File Path'].str.contains('design_'), 'is_kernel'] = False
+
+    df['design_id'] = 'unknown'
+    df['source_name'] = 'unknown'
+    df['algo_name'] = 'unknown'
+    df['solution_name'] = 'unknown'
+    df['project_name'] = 'unknown'
+
+    df['solution_name'] = df['File Path'].str.split('/').str[-4]
+    df['project_name'] = df['File Path'].str.split('/').str[-5]
+    df['algo_name'] = df['File Path'].str.split('/').str[-6]
+    df['source_name'] = df['File Path'].str.split('/').str[-7]
+
+    # Ensure the boolean mask is correctly aligned
+    design_rows = df['is_kernel'] == False
+
+    # Check if there are any valid design rows and if paths are long enough
+    if design_rows.any() and max_parts >= 8:
+        # Safely access the path parts
+        try:
+            df.loc[design_rows, 'design_id'] = path_parts.loc[design_rows].str[-8]
+        except IndexError:
+            print("Some paths are too short to extract 'design_id'.")
+            df.loc[design_rows, 'design_id'] = 'unknown'
 
     df = df.reset_index(drop=True)
     print_info(df)
@@ -327,25 +340,16 @@ def embed_source_code(df):
     
     # 计算代码长度 - 只计算源代码文件的长度
     df['code_length'] = [sum([len(file['file_content']) for file in sc if file['file_name'].endswith((".c", ".cpp"))]) for sc in source_codes]
+   
+    # tiktoken计算token数量 -  只计算c c++ 源代码文件的token
+    def count_tokens(code):
+        if pd.isna(code):
+            return 0
+        # 使用cl100k_base编码器，这是GPT-4使用的编码器
+        encoding = tiktoken.get_encoding("cl100k_base")
+        return len(encoding.encode(code))
+    df['token_count'] = df['source_code'].apply(lambda x: sum([count_tokens(file['file_content']) for file in x if file['file_name'].endswith((".c", ".cpp"))]))
 
-    print(f"Successfully embedded source code")
-    return df
-
-def add_is_kernel(df):
-    if df.empty:
-        print("DataFrame为空，无法添加kernel信息")
-        return df
-        
-    # 使用向量化操作
-    df['is_kernel'] = df['File Path'].astype(str).str.contains('kernels')
-    print(f"Successfully added 'is_kernel' column")
-    return df
-
-def add_pragma_number(df):
-    if df.empty:
-        print("DataFrame为空，无法添加pragma数量")
-        return df
-        
     # 编译正则表达式模式以提高性能
     pragma_pattern = re.compile(r'#pragma.*')
     
@@ -361,19 +365,22 @@ def add_pragma_number(df):
         pragma_numbers = list(executor.map(get_pragma_number, df['source_code']))
     
     df['pragma_number'] = pragma_numbers
-    print(f"Successfully added 'pragma_number' column")
+
+    print(f"Successfully embedded source code")
     return df
+
 
 def analysis(df, save_path, dataset_name):
     if df.empty:
         print("DataFrame为空，无法生成分析")
-        analysis_df = pd.DataFrame(columns=['algo_name', 'source_name', 'pragma_number', 'design_number', 'code_length'])
+        analysis_df = pd.DataFrame(columns=['algo_name', 'source_name', 'pragma_number', 'design_number', 'code_length', 'token_count'])
     else:
         # 使用groupby的agg函数一次性计算所有需要的统计信息
         analysis_df = df.groupby('algo_name').agg({
             'source_name': 'first',  # 取第一个source_name
             'pragma_number': 'first',  # 取第一个pragma_number
-            'code_length': 'first'  # 取第一个code_length
+            'code_length': 'first',  # 取第一个code_length
+            'token_count': 'first'  # 取第一个token_count
         }).reset_index()
         
         # 添加设计数量列
@@ -415,7 +422,7 @@ def add_top_function_name(df):
                     top_function_cache[file_path] = top_function_name
                     return top_function_name
             else:
-                print(f"找不到顶层函数名文件: {top_function_name_path}")
+                print(f"找不到顶层函数名文件: {top_function_name_path}, 请运行extract_top_function_name.py提取顶层函数名")
                 return "unknown"
         except Exception as e:
             print(f"获取顶层函数名时出错: {file_path}, 错误: {str(e)}")
@@ -457,9 +464,9 @@ def dataset_csv(search_path, save_path):
         return
     
     # 处理设计数据
+    df = add_top_function_name(df)
     df = base_feature(df)
     df = embed_source_code(df)
-    df = add_pragma_number(df)
 
     # 生成分析数据
     analysis(df, save_path, dataset_name)
@@ -469,12 +476,11 @@ def dataset_csv(search_path, save_path):
     if not df.empty:
         df = delete_overlap_and_overfitting(df)
         df = add_is_pareto(df)
-        df = add_is_kernel(df)
-        df = add_top_function_name(df)
+        # df = add_latency_resource_strategy(df) # todo: merge from HLSBatchProcessor/downstream_task/pragma_insertion/src1/add_latency_resource_strategy_complete.py
 
         # 保存到JSON
         output_json_path = os.path.join(save_path, f'data_of_designs_{dataset_name}.json')
-        df.to_json(output_json_path, orient='records', lines=True, force_ascii=False)
+        df.to_json(output_json_path, orient='records', force_ascii=False, indent=4)
         print(f"The JSON file is saved in {output_json_path}")
     else:
         print("数据处理后为空，不生成最终JSON文件")
@@ -491,3 +497,5 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     dataset_csv(args.search_path, args.save_path)
+
+# howtouse: python dataset_csv.py --search_path ../data/kernels/ --save_path ./kernels_csv/

@@ -13,3 +13,5 @@ GNN/dataset
 GNN/saves
 Graphs/forgehls_kernels
 GNN/src/differential_output_e2e
+GNN/differential_output_e2e
+GNN/graph_cache

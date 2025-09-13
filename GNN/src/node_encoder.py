@@ -21,7 +21,10 @@ class NodeEncoder(torch.nn.Module):
     def forward(self, x):
         x_embedding = 0
         for i in range(x.shape[1]):
-            x_embedding += self.node_embedding_list[i](x[:,i])
+            # Clamp values to valid embedding range to prevent CUDA assertion errors
+            max_val = full_node_feature_dims[i] - 1
+            x_clamped = torch.clamp(x[:,i], 0, max_val)
+            x_embedding += self.node_embedding_list[i](x_clamped)
 
         return x_embedding
 
