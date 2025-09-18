@@ -16,9 +16,11 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 features=("dsp" "lut" "ff")
+# features=("dsp")
 # differentials=("true" "false")
 differentials=("false")
-gnn=("gin" "gcn" "rgcn" "fast_rgcn")
+# gnn=("gin" "gcn" "rgcn" "fast_rgcn")
+gnn=("gin")
 
 for differential in "${differentials[@]}"; do
   for feature in "${features[@]}"; do
@@ -26,15 +28,18 @@ for differential in "${differentials[@]}"; do
     python train_e2e.py \
     --kernel_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_kernels \
     --design_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_lite_100designs \
+    --ood_design_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_benchmark \
     --output_dir ./output \
     --cache_root ./graph_cache \
-    --gnn_type gcn \
+    --gnn_type gin \
     --epochs 300 \
     --batch_size 32 \
-    --hidden_dim 128 \
-    --num_layers 3 \
+    --hidden_dim 64 \
+    --num_layers 2 \
     --dropout 0.1 \
-    --lr 0.001 \
+    --lr 1e-3 \
+    --grad_accum_steps 1 \
+    --warmup_epochs 5 \
     --target_metric $feature \
     --differential $differential &
   done

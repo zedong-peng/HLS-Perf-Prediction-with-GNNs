@@ -525,8 +525,9 @@ class SimpleDifferentialGNN(nn.Module):
             else:
                 raise ValueError(f"不支持的GNN类型: {self.gnn_type}. 支持的类型: gcn, gin, rgcn, fast_rgcn")
             
-            # 为所有GNN类型添加BatchNorm
-            self.batch_norms.append(BatchNorm(hidden_dim))
+            # 为所有GNN类型添加归一化层（使用LayerNorm以避免单样本BatchNorm错误）
+            from torch_geometric.nn import LayerNorm
+            self.batch_norms.append(LayerNorm(hidden_dim))
         
         # 预测头 - 根据模式选择输入维度
         input_dim = hidden_dim * 2 if differential else hidden_dim  # differential: kernel+design, direct: design only
@@ -847,6 +848,15 @@ def _create_prediction_plots(test_metrics: Dict, target_metric: str, output_dir:
     swanlab.log({"prediction_scatter": swanlab.Image(scatter_path)})
 
 
+# =========================================================================
+# Table logging helper (SwanLab)
+# =========================================================================
+
+def _log_table_safe(table_key: str, columns: List[str], rows: List[List], output_dir: str):
+    """已停用的表格上传函数：不再向 SwanLab 上传表格或生成 CSV。"""
+    return
+
+
 # ============================================================================
 # Main Training Function
 # ============================================================================
@@ -862,6 +872,9 @@ def main():
     parser.add_argument('--design_base_dir', type=str,
                         default='/home/user/zedongpeng/workspace/Huggingface/forgehls_lite_10designs/',
                         help='Design数据根目录')
+    parser.add_argument('--ood_design_base_dir', type=str,
+                        default='/home/user/zedongpeng/workspace/Huggingface/forgehls_benchmark',
+                        help='OOD Design数据根目录（可选，不存在则跳过 OOD 评估）')
     
     # 模型参数
     parser.add_argument('--target_metric', type=str, default='dsp',
@@ -899,6 +912,10 @@ def main():
                         choices=['true', 'false'],
                         help='是否使用差分学习模式：true=差分学习(kernel+design)，false=直接预测(仅design)')
     
+    # 训练策略参数
+    parser.add_argument('--warmup_epochs', type=int, default=5, help='Linear warmup 的 epoch 数（0 表示关闭）')
+    parser.add_argument('--min_lr', type=float, default=1e-5, help='学习率下限（避免过小导致训练停滞）')
+    
     args = parser.parse_args()
     
     # 设置设备
@@ -935,8 +952,24 @@ def main():
         swanlab.finish()
         return
     
+    # 额外：构建 OOD 配对（如果提供）
+    ood_pairs = []
+    if args.ood_design_base_dir and os.path.exists(args.ood_design_base_dir):
+        ood_processor = E2EDifferentialProcessor(
+            kernel_base_dir=args.kernel_base_dir,
+            design_base_dir=args.ood_design_base_dir,
+            output_dir=output_dir,
+            cache_root=args.cache_root,
+            rebuild_cache=args.rebuild_cache
+        )
+        ood_pairs = ood_processor.collect_all_data()
+    else:
+        print(f"提示: OOD 路径不可用或未提供，将跳过 OOD 评估: {args.ood_design_base_dir}")
+    
     # 记录数据集信息
     swanlab.log({"dataset/total_pairs": len(pairs)})
+    if ood_pairs:
+        swanlab.log({"dataset/ood_pairs": len(ood_pairs)})
     
     # 限制配对数量（调试用）
     if args.max_pairs and len(pairs) > args.max_pairs:
@@ -960,8 +993,11 @@ def main():
     with open(pairs_path, 'w') as f:
         json.dump(pairs_info, f, indent=2)
     
+    # 不再上传表格形式的配对信息，保留 JSON 文件以便线下查看
+    
     # 创建数据集
     dataset = E2EDifferentialDataset(pairs, args.target_metric)
+    ood_dataset = E2EDifferentialDataset(ood_pairs, args.target_metric) if ood_pairs else None
     
     # 数据集划分 - 8:1:1随机划分
     total_size = len(dataset)
@@ -977,6 +1013,7 @@ def main():
     train_dataset = torch.utils.data.Subset(dataset, train_indices)
     valid_dataset = torch.utils.data.Subset(dataset, valid_indices)
     test_dataset = torch.utils.data.Subset(dataset, test_indices)
+    ood_test_dataset = ood_dataset  if ood_dataset is not None else None
     
     # 记录数据划分信息
     swanlab.log({
@@ -984,6 +1021,8 @@ def main():
         "dataset/valid_size": len(valid_dataset), 
         "dataset/test_size": len(test_dataset)
     })
+    
+    # 不再以表格形式记录数据集划分；仅保留标量日志
     
     # 创建数据加载器
     train_loader = torch.utils.data.DataLoader(
@@ -1001,6 +1040,13 @@ def main():
         collate_fn=differential_collate_fn, num_workers=0,
         pin_memory=True
     )
+    ood_test_loader = None
+    if ood_test_dataset is not None:
+        ood_test_loader = torch.utils.data.DataLoader(
+            ood_test_dataset, batch_size=args.batch_size, shuffle=False,
+            collate_fn=differential_collate_fn, num_workers=0,
+            pin_memory=True
+        )
     
     # ==================== 创建模型 ====================
     
@@ -1022,7 +1068,15 @@ def main():
     
     # 优化器和调度器
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=15, verbose=False)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=15)
+    
+    # 学习率工具函数
+    def _set_optimizer_lr(optim_obj, lr_value):
+        for group in optim_obj.param_groups:
+            group['lr'] = lr_value
+    
+    def _get_optimizer_lr(optim_obj):
+        return optim_obj.param_groups[0]['lr']
     
     # 记录模型信息
     model_params = sum(p.numel() for p in model.parameters())
@@ -1040,12 +1094,20 @@ def main():
     test_losses = []
     valid_metrics_history = []
     test_metrics_history = []
+    ood_metrics_history = []
     lr_history = []
     
     best_valid_loss = float('inf')
     best_epoch = 0
     
     for epoch in range(1, args.epochs + 1):
+        # 线性 warmup（仅在前 warmup_epochs 个 epoch 生效）
+        if args.warmup_epochs and epoch <= args.warmup_epochs:
+            warmup_factor = float(epoch) / float(max(1, args.warmup_epochs))
+            current_warmup_lr = max(args.lr * warmup_factor, args.min_lr)
+            _set_optimizer_lr(optimizer, current_warmup_lr)
+            swanlab.log({"optimizer/warmup_factor": warmup_factor})
+        
         # 训练
         train_loss = train_epoch(
             model, device, train_loader, optimizer,
@@ -1061,20 +1123,40 @@ def main():
         valid_losses.append(valid_loss)
         valid_metrics_history.append(valid_metrics)
         
-        # 测试
-        test_metrics = evaluate_model(
+        # ID 测试
+        id_test_metrics = evaluate_model(
             model, test_loader, device, args.target_metric
         )
-        test_loss = test_metrics['avg_loss']
-        test_losses.append(test_loss)
-        test_metrics_history.append(test_metrics)
+        id_test_loss = id_test_metrics['avg_loss']
+        test_losses.append(id_test_loss)
+        test_metrics_history.append(id_test_metrics)
         
-        # 学习率调度
-        scheduler.step(valid_loss)
-        current_lr = optimizer.param_groups[0]['lr']
+        # OOD 测试（可选）
+        ood_test_metrics = None
+        if ood_test_loader is not None:
+            ood_test_metrics = evaluate_model(
+                model, ood_test_loader, device, args.target_metric
+            )
+            ood_metrics_history.append(ood_test_metrics)
+        
+        # 学习率调度（warmup 期间不触发 ReduceLROnPlateau）
+        if not args.warmup_epochs or epoch > args.warmup_epochs:
+            scheduler.step(valid_loss)
+            # 下限保护，避免 lr 过小
+            try:
+                cur_lr = scheduler.get_last_lr()[0]
+            except Exception:
+                cur_lr = _get_optimizer_lr(optimizer)
+            if cur_lr < args.min_lr:
+                _set_optimizer_lr(optimizer, args.min_lr)
+        
+        try:
+            current_lr = scheduler.get_last_lr()[0]
+        except Exception:
+            current_lr = _get_optimizer_lr(optimizer)
         lr_history.append(current_lr)
         
-        # 记录到SwanLab
+        # 记录到SwanLab（ID test / OOD test 区分）
         swanlab.log({
             "epoch": epoch,
             "train/loss": train_loss,
@@ -1083,15 +1165,22 @@ def main():
             "valid/delta_rmse": valid_metrics.get('delta_rmse', 0),
             "valid/delta_ulti_rmse": valid_metrics.get('delta_ulti_rmse', 0),
             "valid/delta_r2": valid_metrics.get('delta_r2', 0),
-            "test/loss": test_loss,
-            "test/delta_mae": test_metrics.get('delta_mae', 0),
-            "test/delta_rmse": test_metrics.get('delta_rmse', 0),
-            "test/delta_ulti_rmse": test_metrics.get('delta_ulti_rmse', 0),
-            "test/delta_r2": test_metrics.get('delta_r2', 0),
-            "optimizer/lr": current_lr
+            "id_test/loss": id_test_loss,
+            "id_test/delta_mae": id_test_metrics.get('delta_mae', 0),
+            "id_test/delta_rmse": id_test_metrics.get('delta_rmse', 0),
+            "id_test/delta_ulti_rmse": id_test_metrics.get('delta_ulti_rmse', 0),
+            "id_test/delta_r2": id_test_metrics.get('delta_r2', 0),
+            "optimizer/lr": current_lr,
+            **({
+                "ood_test/loss": ood_test_metrics.get('avg_loss', 0),
+                "ood_test/delta_mae": ood_test_metrics.get('delta_mae', 0),
+                "ood_test/delta_rmse": ood_test_metrics.get('delta_rmse', 0),
+                "ood_test/delta_ulti_rmse": ood_test_metrics.get('delta_ulti_rmse', 0),
+                "ood_test/delta_r2": ood_test_metrics.get('delta_r2', 0)
+            } if ood_test_metrics is not None else {})
         })
         
-        # 保存最佳模型
+        # 保存最佳模型（基于验证集）
         if valid_loss < best_valid_loss:
             best_valid_loss = valid_loss
             best_epoch = epoch
@@ -1102,7 +1191,8 @@ def main():
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'valid_loss': valid_loss,
-                'test_metrics': test_metrics,
+                'id_test_metrics': id_test_metrics,
+                'ood_test_metrics': ood_test_metrics,
                 'args': vars(args)
             }, model_path)
             
@@ -1118,22 +1208,34 @@ def main():
         swanlab.log({
             "final/best_epoch": best_epoch,
             "final/best_valid_loss": best_valid_loss,
-            "final/delta_mae": best_test.get('delta_mae', 0),
-            "final/delta_rmse": best_test.get('delta_rmse', 0),
-            "final/delta_ulti_rmse": best_test.get('delta_ulti_rmse', 0),
-            "final/delta_r2": best_test.get('delta_r2', 0)
+            "final/id_delta_mae": best_test.get('delta_mae', 0),
+            "final/id_delta_rmse": best_test.get('delta_rmse', 0),
+            "final/id_delta_ulti_rmse": best_test.get('delta_ulti_rmse', 0),
+            "final/id_delta_r2": best_test.get('delta_r2', 0)
         })
         
-        # 创建最佳epoch的预测vs真实散点图
+        # 如果 OOD 可用，也记录最佳 epoch 对应的 OOD 指标（同一 epoch 下）
+        if 'ood_test_loader' in locals() and ood_test_loader is not None:
+            best_ood_metrics = evaluate_model(model, ood_test_loader, device, args.target_metric)
+            swanlab.log({
+                "final/ood_delta_mae": best_ood_metrics.get('delta_mae', 0),
+                "final/ood_delta_rmse": best_ood_metrics.get('delta_rmse', 0),
+                "final/ood_delta_ulti_rmse": best_ood_metrics.get('delta_ulti_rmse', 0),
+                "final/ood_delta_r2": best_ood_metrics.get('delta_r2', 0)
+            })
+        
+        # 创建最佳epoch的预测vs真实散点图（仅 ID test ）
         if 'delta_preds' in best_test and 'delta_true' in best_test:
             _create_prediction_plots(best_test, args.target_metric, output_dir)
         
         print(f"训练完成! 最佳模型 ({args.target_metric.upper()}):")
         print(f"  Epoch: {best_epoch}")
-        print(f"  差值MAE: {best_test.get('delta_mae', 0):.6f}")
-        print(f"  差值RMSE: {best_test.get('delta_rmse', 0):.6f}")
-        print(f"  差值ulti-RMSE: {best_test.get('delta_ulti_rmse', 0):.8f}")
-        print(f"  差值R²: {best_test.get('delta_r2', 0):.4f}")
+        print(f"  [ID] 差值MAE: {best_test.get('delta_mae', 0):.6f}")
+        print(f"  [ID] 差值RMSE: {best_test.get('delta_rmse', 0):.6f}")
+        print(f"  [ID] 差值ulti-RMSE: {best_test.get('delta_ulti_rmse', 0):.8f}")
+        print(f"  [ID] 差值R²: {best_test.get('delta_r2', 0):.4f}")
+        if 'ood_test_loader' in locals() and ood_test_loader is not None:
+            print(f"  [OOD] 已在 SwanLab 记录最终 OOD 指标")
     
     # 保存训练历史 - 清理tensor数据避免JSON序列化错误
     clean_valid_history = []
@@ -1150,9 +1252,15 @@ def main():
     results = {
         'train_losses': train_losses,
         'valid_losses': valid_losses,
-        'test_losses': test_losses,
+        'id_test_losses': test_losses,
         'valid_metrics_history': clean_valid_history,
-        'test_metrics_history': clean_test_history,
+        'id_test_metrics_history': clean_test_history,
+        'ood_test_metrics_history': (
+            [
+                {k: v for k, v in m.items() if not isinstance(v, torch.Tensor)}
+                for m in ood_metrics_history
+            ] if ood_metrics_history else []
+        ),
         'best_epoch': best_epoch,
         'best_valid_loss': best_valid_loss,
         'args': vars(args),
@@ -1172,28 +1280,35 @@ def main():
     # 合并 Loss 与 MAE（因为 loss == MAE）: 展示 train(valid loss=mae), valid/test delta_mae 三条曲线
     if valid_metrics_history:
         delta_mae_valid = [m.get('delta_mae', 0) for m in valid_metrics_history]
-        delta_mae_test = [m.get('delta_mae', 0) for m in test_metrics_history]
+        delta_mae_id_test = [m.get('delta_mae', 0) for m in test_metrics_history]
+        delta_mae_ood_test = [m.get('delta_mae', 0) for m in ood_metrics_history] if ood_metrics_history else []
     else:
-        delta_mae_valid, delta_mae_test = [], []
+        delta_mae_valid, delta_mae_id_test, delta_mae_ood_test = [], [], []
 
     axes[0, 0].plot(epochs, train_losses, color='blue', label='Train (Loss=MAE)', linewidth=2)
     if delta_mae_valid:
         axes[0, 0].plot(epochs, delta_mae_valid, color='orange', label='Valid MAE', linewidth=2)
-    if delta_mae_test:
-        axes[0, 0].plot(epochs, delta_mae_test, color='purple', label='Test MAE', linewidth=2)
+    if test_metrics_history:
+        axes[0, 0].plot(epochs, delta_mae_id_test, color='purple', label='ID Test MAE', linewidth=2)
+    if delta_mae_ood_test:
+        axes[0, 0].plot(epochs, delta_mae_ood_test, color='red', label='OOD Test MAE', linewidth=2)
+    
     axes[0, 0].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7, label='Best Epoch')
     axes[0, 0].set_xlabel('Epoch')
     axes[0, 0].set_ylabel('MAE (Loss)')
-    axes[0, 0].set_title('MAE (Loss) - Train / Valid / Test')
+    axes[0, 0].set_title('MAE (Loss) - Train / Valid / ID Test / OOD Test')
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
     
     # 差值RMSE (放在 (0,1))
     if valid_metrics_history:
         delta_rmse_valid = [m.get('delta_rmse', 0) for m in valid_metrics_history]
-        delta_rmse_test = [m.get('delta_rmse', 0) for m in test_metrics_history]
+        delta_rmse_id_test = [m.get('delta_rmse', 0) for m in test_metrics_history]
+        delta_rmse_ood_test = [m.get('delta_rmse', 0) for m in ood_metrics_history] if ood_metrics_history else []
         axes[0, 1].plot(epochs, delta_rmse_valid, 'cyan', label='Valid Delta RMSE', linewidth=2)
-        axes[0, 1].plot(epochs, delta_rmse_test, 'magenta', label='Test Delta RMSE', linewidth=2)
+        axes[0, 1].plot(epochs, delta_rmse_id_test, 'magenta', label='ID Test Delta RMSE', linewidth=2)
+        if delta_rmse_ood_test:
+            axes[0, 1].plot(epochs, delta_rmse_ood_test, color='darkred', label='OOD Test Delta RMSE', linewidth=2)
         axes[0, 1].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7)
         axes[0, 1].set_xlabel('Epoch')
         axes[0, 1].set_ylabel('Delta RMSE')
@@ -1204,9 +1319,12 @@ def main():
     # 差值R2曲线 (放在 (1,0))
     if valid_metrics_history:
         delta_r2_valid = [m.get('delta_r2', 0) for m in valid_metrics_history]
-        delta_r2_test = [m.get('delta_r2', 0) for m in test_metrics_history]
+        delta_r2_id_test = [m.get('delta_r2', 0) for m in test_metrics_history]
+        delta_r2_ood_test = [m.get('delta_r2', 0) for m in ood_metrics_history] if ood_metrics_history else []
         axes[1, 0].plot(epochs, delta_r2_valid, 'brown', label='Valid Delta R²', linewidth=2)
-        axes[1, 0].plot(epochs, delta_r2_test, 'pink', label='Test Delta R²', linewidth=2)
+        axes[1, 0].plot(epochs, delta_r2_id_test, 'pink', label='ID Test Delta R²', linewidth=2)
+        if delta_r2_ood_test:
+            axes[1, 0].plot(epochs, delta_r2_ood_test, color='firebrick', label='OOD Test Delta R²', linewidth=2)
         axes[1, 0].axvline(x=best_epoch, color='green', linestyle='--', alpha=0.7)
         axes[1, 0].set_xlabel('Epoch')
         axes[1, 0].set_ylabel('R² Score')
