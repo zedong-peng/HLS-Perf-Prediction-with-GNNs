@@ -1,5 +1,6 @@
 # High-Level Synthesis Performance Prediction using GNNs: Benchmarking, Modeling, and Advancing
 
+
 ```mermaid
 flowchart TB
     subgraph KernelBranch["Kernel Branch"]

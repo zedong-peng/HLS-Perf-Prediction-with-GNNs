@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Any
 # ============================================================================
 
 allowable_features = {
-    'node_category': ['nodes', 'blocks', 'ports', 'misc'],
+    'node_category': ['nodes', 'blocks', 'ports', 'regions', 'misc'],
     'bitwidth': list(range(0, 256)) + ['misc'],
     'opcode_category': ['terminator', 'binary_unary', 'bitwise', 'conversion', 'memory', 'aggregate', 'other', 'misc'],
     'possible_opcode_list': [
@@ -31,6 +31,7 @@ allowable_features = {
         'extractvalue', 'insertvalue',
         'alloca', 'load', 'store', 'read', 'write', 'getelementptr',
         'phi', 'call', 'icmp', 'dcmp', 'fcmp', 'select', 'bitselect', 'partselect', 'mux', 'dacc',
+        'bitset',   # 新增，便于更细粒度统计（可选）
         'misc'
     ],
     'possible_is_start_of_path': [0, 1, 'misc'],
@@ -39,8 +40,12 @@ allowable_features = {
     'LUT': list(range(0, 1000)) + ['misc'],
     'DSP': list(range(0, 11)) + ['misc'],
     'FF': list(range(0, 1000)) + ['misc'],
-    'possible_edge_type_list': [1, 2, 3, 'misc'],
+    'possible_edge_type_list': [1, 2, 3, 4, 'misc'],  # 新增 4: region_contains
     'possible_is_back_edge': [0, 1],
+    # 新增：流水线相关的节点特征空间（离散桶化，含 'misc' 兜底）
+    'possible_region_is_pipelined': [0, 1, 'misc'],
+    'region_ii_bucket': list(range(0, 65)) + ['misc'],
+    'region_pipe_depth_bucket': list(range(0, 65)) + ['misc'],
 }
 
 
@@ -57,25 +62,35 @@ def safe_index(l: List, e: Any) -> int:
 
 
 def opcode_type(opcode: str) -> str:
-    """获取操作码类型"""
-    t = 'misc'
-    if opcode in {'br', 'ret', 'switch'}:
-        t = 'terminator'
-    elif opcode in {'add', 'dadd', 'fadd', 'sub', 'dsub', 'fsub', 'mul', 'dmul', 'fmul', 'udiv', 'ddiv', 'fdiv', 'sdiv', 'urem', 'srem', 'frem', 'dexp', 'dsqrt'}:
-        t = 'binary_unary'
-    elif opcode in {'shl', 'lshr', 'ashr', 'and', 'xor', 'or'}:
-        t = 'bitwise'
-    elif opcode in {'uitofp', 'sitofp', 'uitodp', 'sitodp', 'bitconcatenate', 'bitcast', 'zext', 'sext', 'fpext', 'trunc', 'fptrunc'}:
-        t = 'conversion'
-    elif opcode in {'alloca', 'load', 'store', 'read', 'write', 'getelementptr'}:
-        t = 'memory'
-    elif opcode in {'extractvalue', 'insertvalue'}:
-        t = 'aggregate'
-    elif opcode in {'phi', 'call', 'icmp', 'dcmp', 'fcmp', 'select', 'bitselect', 'partselect', 'mux', 'dacc', 'sparsemux'}:
-        t = 'other'
-    if t == 'misc':
-        print(f"opcode: {opcode}")
-    return t
+    o = (opcode or 'misc').lower()
+    if o in {'br', 'ret', 'switch'}:
+        return 'terminator'
+    if o in {'add', 'dadd', 'fadd', 'sub', 'dsub', 'fsub', 'mul', 'dmul', 'fmul',
+             'udiv', 'ddiv', 'fdiv', 'sdiv', 'urem', 'srem', 'frem', 'dexp', 'dsqrt'}:
+        return 'binary_unary'
+    if o in {'shl', 'lshr', 'ashr', 'and', 'xor', 'or'}:
+        return 'bitwise'
+    if o in {'uitofp', 'sitofp', 'uitodp', 'sitodp', 'bitconcatenate', 'bitcast',
+             'zext', 'sext', 'fpext', 'trunc', 'fptrunc'}:
+        return 'conversion'
+    if o in {'alloca', 'load', 'store', 'read', 'write', 'getelementptr'}:
+        return 'memory'
+    if o in {'extractvalue', 'insertvalue'}:
+        return 'aggregate'
+    if o in {'phi', 'call', 'icmp', 'dcmp', 'fcmp', 'select', 'bitselect', 'partselect', 'mux', 'dacc', 'sparsemux'}:
+        return 'other'
+    # 规则兜底：包含“bit”归到 bitwise；常见字符串模式辅助归类；否则 other
+    if 'bit' in o:
+        return 'bitwise'
+    if any(tok in o for tok in ['add','sub','mul','div','rem','sqrt','exp']):
+        return 'binary_unary'
+    if any(tok in o for tok in ['load','store','read','write','alloca','gep','getelementptr']):
+        return 'memory'
+    if any(tok in o for tok in ['zext','sext','trunc','cast','ext','tofp','todp']):
+        return 'conversion'
+    if any(tok in o for tok in ['extract','insert','aggregate']):
+        return 'aggregate'
+    return 'other'
 
 
 def get_rtl_hash_table(root) -> Dict[str, Dict[str, str]]:
@@ -112,7 +127,8 @@ def get_rtl_hash_table(root) -> Dict[str, Dict[str, str]]:
 
 def node_to_feature_vector(node: Dict) -> List[int]:
     """将节点转换为特征向量"""
-    if node == {}:
+    # 完全空节点：返回全 misc/默认桶
+    if node == {} or node is None:
         node_feature = [
             len(allowable_features['node_category']) - 1,
             len(allowable_features['bitwidth']) - 1,
@@ -123,27 +139,81 @@ def node_to_feature_vector(node: Dict) -> List[int]:
             len(allowable_features['possible_cluster_group_num']) - 1,
             len(allowable_features['LUT']) - 1,
             len(allowable_features['DSP']) - 1,
-            len(allowable_features['FF']) - 1
+            len(allowable_features['FF']) - 1,
+            # 新增三维：流水线特征
+            len(allowable_features['possible_region_is_pipelined']) - 1,
+            len(allowable_features['region_ii_bucket']) - 1,
+            len(allowable_features['region_pipe_depth_bucket']) - 1,
         ]
         return node_feature
 
-    if node['category'] == 'nodes':
+    # 统一兜底读取，避免 KeyError
+    category = node.get('category', 'misc')
+    try:
+        bitwidth_val = int(node.get('bitwidth', 0))
+    except Exception:
+        bitwidth_val = 0
+    opcode_val = node.get('opcode', 'misc')
+    try:
+        is_start_of_path_val = int(node.get('m_isStartOfPath', 0))
+    except Exception:
+        is_start_of_path_val = 0
+    try:
+        is_lcdnode_val = int(node.get('m_isLCDNode', 0))
+    except Exception:
+        is_lcdnode_val = 0
+    try:
+        cluster_group_num_val = int(node.get('m_clusterGroupNumber', -1))
+    except Exception:
+        cluster_group_num_val = -1
+    try:
+        lut_val = int(node.get('LUT', 0))
+    except Exception:
+        lut_val = 0
+    try:
+        dsp_val = int(node.get('DSP', 0))
+    except Exception:
+        dsp_val = 0
+    try:
+        ff_val = int(node.get('FF', 0))
+    except Exception:
+        ff_val = 0
+
+    # 提取统一的流水线特征（若缺失则置为0）
+    try:
+        region_is_pipelined_val = int(node.get('region_is_pipelined', 0))
+    except Exception:
+        region_is_pipelined_val = 0
+    try:
+        region_ii_val = max(0, min(64, int(node.get('region_ii', 0))))
+    except Exception:
+        region_ii_val = 0
+    try:
+        region_pipe_depth_val = max(0, min(64, int(node.get('region_pipe_depth', 0))))
+    except Exception:
+        region_pipe_depth_val = 0
+
+    if category == 'nodes':
         node_feature = [
-            safe_index(allowable_features['node_category'], node['category']),
-            safe_index(allowable_features['bitwidth'], int(node['bitwidth'])),
-            safe_index(allowable_features['opcode_category'], opcode_type(node['opcode'])),
-            safe_index(allowable_features['possible_opcode_list'], node['opcode']),
-            safe_index(allowable_features['possible_is_start_of_path'], int(node['m_isStartOfPath'])),
-            safe_index(allowable_features['possible_is_LCDnode'], int(node['m_isLCDNode'])),
-            safe_index(allowable_features['possible_cluster_group_num'], int(node['m_clusterGroupNumber'])),
-            safe_index(allowable_features['LUT'], int(node['LUT'])),
-            safe_index(allowable_features['DSP'], int(node['DSP'])),
-            safe_index(allowable_features['FF'], int(node['FF']))
+            safe_index(allowable_features['node_category'], category),
+            safe_index(allowable_features['bitwidth'], bitwidth_val),
+            safe_index(allowable_features['opcode_category'], opcode_type(opcode_val)),
+            safe_index(allowable_features['possible_opcode_list'], opcode_val),
+            safe_index(allowable_features['possible_is_start_of_path'], is_start_of_path_val),
+            safe_index(allowable_features['possible_is_LCDnode'], is_lcdnode_val),
+            safe_index(allowable_features['possible_cluster_group_num'], cluster_group_num_val),
+            safe_index(allowable_features['LUT'], lut_val),
+            safe_index(allowable_features['DSP'], dsp_val),
+            safe_index(allowable_features['FF'], ff_val),
+            # 新增：流水线特征
+            safe_index(allowable_features['possible_region_is_pipelined'], region_is_pipelined_val),
+            safe_index(allowable_features['region_ii_bucket'], region_ii_val),
+            safe_index(allowable_features['region_pipe_depth_bucket'], region_pipe_depth_val),
         ]
-    elif node['category'] == 'ports':
+    elif category == 'ports':
         node_feature = [
-            safe_index(allowable_features['node_category'], node['category']),
-            safe_index(allowable_features['bitwidth'], int(node['bitwidth'])),
+            safe_index(allowable_features['node_category'], category),
+            safe_index(allowable_features['bitwidth'], bitwidth_val),
             len(allowable_features['opcode_category']) - 1,
             len(allowable_features['possible_opcode_list']) - 1,
             len(allowable_features['possible_is_start_of_path']) - 1,
@@ -151,11 +221,15 @@ def node_to_feature_vector(node: Dict) -> List[int]:
             len(allowable_features['possible_cluster_group_num']) - 1,
             len(allowable_features['LUT']) - 1,
             len(allowable_features['DSP']) - 1,
-            len(allowable_features['FF']) - 1
+            len(allowable_features['FF']) - 1,
+            # 新增：流水线特征（端口无区域，统一置0）
+            safe_index(allowable_features['possible_region_is_pipelined'], region_is_pipelined_val),
+            safe_index(allowable_features['region_ii_bucket'], region_ii_val),
+            safe_index(allowable_features['region_pipe_depth_bucket'], region_pipe_depth_val),
         ]
-    elif node['category'] == 'blocks':
+    elif category == 'blocks':
         node_feature = [
-            safe_index(allowable_features['node_category'], node['category']),
+            safe_index(allowable_features['node_category'], category),
             len(allowable_features['bitwidth']) - 1,
             len(allowable_features['opcode_category']) - 1,
             len(allowable_features['possible_opcode_list']) - 1,
@@ -164,8 +238,47 @@ def node_to_feature_vector(node: Dict) -> List[int]:
             len(allowable_features['possible_cluster_group_num']) - 1,
             len(allowable_features['LUT']) - 1,
             len(allowable_features['DSP']) - 1,
-            len(allowable_features['FF']) - 1
+            len(allowable_features['FF']) - 1,
+            # 新增：流水线特征（块节点上优先体现）
+            safe_index(allowable_features['possible_region_is_pipelined'], region_is_pipelined_val),
+            safe_index(allowable_features['region_ii_bucket'], region_ii_val),
+            safe_index(allowable_features['region_pipe_depth_bucket'], region_pipe_depth_val),
         ]
+    elif category == 'regions':
+        # 区域节点：无 opcode/bitwidth，承载流水线属性
+        node_feature = [
+            safe_index(allowable_features['node_category'], category),
+            len(allowable_features['bitwidth']) - 1,
+            len(allowable_features['opcode_category']) - 1,
+            len(allowable_features['possible_opcode_list']) - 1,
+            len(allowable_features['possible_is_start_of_path']) - 1,
+            len(allowable_features['possible_is_LCDnode']) - 1,
+            len(allowable_features['possible_cluster_group_num']) - 1,
+            len(allowable_features['LUT']) - 1,
+            len(allowable_features['DSP']) - 1,
+            len(allowable_features['FF']) - 1,
+            safe_index(allowable_features['possible_region_is_pipelined'], region_is_pipelined_val),
+            safe_index(allowable_features['region_ii_bucket'], region_ii_val),
+            safe_index(allowable_features['region_pipe_depth_bucket'], region_pipe_depth_val),
+        ]
+    else:
+        # 未知类别：按普通 nodes 逻辑兜底
+        node_feature = [
+            safe_index(allowable_features['node_category'], 'misc'),
+            safe_index(allowable_features['bitwidth'], bitwidth_val),
+            safe_index(allowable_features['opcode_category'], opcode_type(opcode_val)),
+            safe_index(allowable_features['possible_opcode_list'], opcode_val),
+            safe_index(allowable_features['possible_is_start_of_path'], is_start_of_path_val),
+            safe_index(allowable_features['possible_is_LCDnode'], is_lcdnode_val),
+            safe_index(allowable_features['possible_cluster_group_num'], cluster_group_num_val),
+            safe_index(allowable_features['LUT'], lut_val),
+            safe_index(allowable_features['DSP'], dsp_val),
+            safe_index(allowable_features['FF'], ff_val),
+            safe_index(allowable_features['possible_region_is_pipelined'], region_is_pipelined_val),
+            safe_index(allowable_features['region_ii_bucket'], region_ii_val),
+            safe_index(allowable_features['region_pipe_depth_bucket'], region_pipe_depth_val),
+        ]
+
     return node_feature
 
 
@@ -182,6 +295,10 @@ def get_node_feature_dims() -> List[int]:
         allowable_features['LUT'],
         allowable_features['DSP'],
         allowable_features['FF'],
+        # 新增的流水线特征维度
+        allowable_features['possible_region_is_pipelined'],
+        allowable_features['region_ii_bucket'],
+        allowable_features['region_pipe_depth_bucket'],
     ]))
 
 
@@ -206,7 +323,7 @@ def get_edge_feature_dims() -> List[int]:
 # 图解析函数
 # ============================================================================
 
-def parse_xml_into_graph_single(xml_file: str) -> Optional[nx.DiGraph]:
+def parse_xml_into_graph_single(xml_file: str, hierarchical: bool = False, region: bool = False) -> Optional[nx.DiGraph]:
     """解析XML文件为图"""
     prefix = ''
     G = nx.DiGraph()
@@ -308,6 +425,152 @@ def parse_xml_into_graph_single(xml_file: str) -> Optional[nx.DiGraph]:
             G.nodes[node_name]['direction'] = node.findall('direction')[0].text
             G.nodes[node_name]['if_type'] = node.findall('if_type')[0].text
             G.nodes[node_name]['array_size'] = node.findall('array_size')[0].text
+
+    # 解析并标注流水区域信息（仅为节点添加属性，不改变拓扑）
+    try:
+        # 默认给所有节点填充0，避免缺失键（仅当 region 开启时对节点进行填充）
+        if region:
+            for n in G.nodes():
+                G.nodes[n]['region_is_pipelined'] = G.nodes[n].get('region_is_pipelined', 0)
+                G.nodes[n]['region_ii'] = G.nodes[n].get('region_ii', 0)
+                G.nodes[n]['region_pipe_depth'] = G.nodes[n].get('region_pipe_depth', 0)
+
+        pipeline_region_count = 0
+        ii_values: List[int] = []
+        pipe_depth_values: List[int] = []
+
+        # 收集区域以便分层模式创建节点
+        region_records = []  # (region_key, is_pipelined, ii, depth, basic_block_ids)
+
+        # cdfg_regions: 循环/区域级别（优先依据 mII/mDepth/mIsDfPipe）
+        for idx, reg in enumerate(root.findall('.//cdfg_regions//item')):
+            try:
+                mII = int(reg.findtext('mII', default='-1'))
+            except Exception:
+                mII = -1
+            try:
+                mDepth = int(reg.findtext('mDepth', default='0'))
+            except Exception:
+                mDepth = 0
+            try:
+                mIsDfPipe = int(reg.findtext('mIsDfPipe', default='0'))
+            except Exception:
+                mIsDfPipe = 0
+            is_pipelined = 1 if ((mII is not None and mII > 0) or (mDepth is not None and mDepth > 0) or (mIsDfPipe == 1)) else 0
+
+            # 标注到 basic_blocks 的节点上（仅当 region 开启时）
+            bb_ids: List[str] = []
+            bb_list = reg.find('basic_blocks')
+            if bb_list is not None:
+                for bb in bb_list.findall('item'):
+                    bb_id = bb.text
+                    if bb_id is None:
+                        continue
+                    bb_ids.append(bb_id)
+                    if region:
+                        node_name = prefix + bb_id
+                        if node_name in G.nodes():
+                            G.nodes[node_name]['region_is_pipelined'] = is_pipelined
+                            G.nodes[node_name]['region_ii'] = max(0, mII if mII is not None and mII > 0 else 0)
+                            G.nodes[node_name]['region_pipe_depth'] = max(0, mDepth if mDepth is not None and mDepth > 0 else 0)
+
+            # 记录区域信息用于层次化
+            region_key = reg.findtext('mTag', default=f'region_{idx}') or f'region_{idx}'
+            region_records.append((region_key, is_pipelined, max(0, mII if mII and mII > 0 else 0), max(0, mDepth if mDepth and mDepth > 0 else 0), bb_ids))
+
+            if is_pipelined:
+                pipeline_region_count += 1
+                if mII is not None and mII > 0:
+                    ii_values.append(mII)
+                if mDepth is not None and mDepth > 0:
+                    pipe_depth_values.append(mDepth)
+
+        # 顶层 regions: interval/pipe_depth（仅用于全局旁证）
+        top_intervals: List[int] = []
+        top_pipe_depths: List[int] = []
+        for reg in root.findall('.//regions//item'):
+            try:
+                iv = int(reg.findtext('interval', default='0'))
+            except Exception:
+                iv = 0
+            try:
+                pd = int(reg.findtext('pipe_depth', default='0'))
+            except Exception:
+                pd = 0
+            if iv > 0:
+                top_intervals.append(iv)
+            if pd > 0:
+                top_pipe_depths.append(pd)
+
+        # 资源/信号旁证
+        pipeline_components_present = 0
+        pipeline_signals_present = 0
+        try:
+            for it in root.findall('.//res/dp_component_resource//item/first'):
+                txt = (it.text or '').lower()
+                if 'flow_control_loop_pipe' in txt:
+                    pipeline_components_present = 1
+                    break
+        except Exception:
+            pass
+        try:
+            # 迭代寄存器/多路复用相关
+            for it in root.findall('.//res/dp_register_resource//item/first'):
+                if it is not None and it.text and 'ap_enable_reg_pp' in it.text:
+                    pipeline_signals_present = 1
+                    break
+            if pipeline_signals_present == 0:
+                for it in root.findall('.//res/dp_multiplexer_resource//item/first'):
+                    if it is not None and it.text and 'ap_enable_reg_pp' in it.text:
+                        pipeline_signals_present = 1
+                        break
+        except Exception:
+            pass
+
+        # 计算全局指标
+        avg_ii = float(sum(ii_values) / len(ii_values)) if ii_values else 0.0
+        max_pipe_depth = int(max(pipe_depth_values) if pipe_depth_values else (max(top_pipe_depths) if top_pipe_depths else 0))
+        has_pipeline = 1 if (pipeline_region_count > 0 or len(top_intervals) > 0 or max_pipe_depth > 0 or pipeline_components_present == 1 or pipeline_signals_present == 1) else 0
+
+        # 写入到图的全局属性
+        G.graph['has_pipeline'] = has_pipeline
+        G.graph['pipeline_region_count'] = pipeline_region_count
+        G.graph['avg_ii'] = avg_ii
+        G.graph['max_pipe_depth'] = max_pipe_depth
+        G.graph['pipeline_components_present'] = pipeline_components_present
+        G.graph['pipeline_signals_present'] = pipeline_signals_present
+
+        # 分层模式：增加区域节点与包含关系边（独立于 region 标志）
+        if hierarchical and region_records:
+            for idx, (rk, is_p, ii, depth, bb_ids) in enumerate(region_records):
+                region_node_name = f"region::{rk}::{idx}"
+                if region_node_name not in G:
+                    G.add_node(region_node_name)
+                G.nodes[region_node_name]['node_name'] = region_node_name
+                G.nodes[region_node_name]['category'] = 'regions'
+                G.nodes[region_node_name]['type'] = 'region'
+                G.nodes[region_node_name]['bitwidth'] = '0'
+                G.nodes[region_node_name]['opcode'] = 'misc'
+                G.nodes[region_node_name]['m_isOnCriticalPath'] = '0'
+                G.nodes[region_node_name]['m_isStartOfPath'] = '0'
+                G.nodes[region_node_name]['m_isLCDNode'] = '0'
+                G.nodes[region_node_name]['m_clusterGroupNumber'] = '-1'
+                G.nodes[region_node_name]['LUT'] = '0'
+                G.nodes[region_node_name]['FF'] = '0'
+                G.nodes[region_node_name]['DSP'] = '0'
+                # 区域节点的流水属性
+                G.nodes[region_node_name]['region_is_pipelined'] = is_p
+                G.nodes[region_node_name]['region_ii'] = ii
+                G.nodes[region_node_name]['region_pipe_depth'] = depth
+
+                # 边：region_contains（region -> basic_block）
+                for bb_id in bb_ids:
+                    bb_node = prefix + bb_id
+                    if bb_node in G:
+                        G.add_edge(region_node_name, bb_node, edge_name=f"rcontains_{idx}_{bb_id}", is_back_edge='0', edge_type='4')
+    except Exception:
+        # 静默失败，不影响原有流程
+        pass
 
     # 移除常量节点
     for nodes in cdfg.iter('consts'):

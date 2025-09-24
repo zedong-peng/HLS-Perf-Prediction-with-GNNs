@@ -751,8 +751,7 @@ class GNNTrainer:
             mode=scheduler_mode, 
             factor=scheduler_config['factor'],
             patience=scheduler_config['patience'], 
-            min_lr=scheduler_config['min_lr'], 
-            verbose=True
+            min_lr=scheduler_config['min_lr']
         )
         
         # Store scheduler info
@@ -802,7 +801,10 @@ class GNNTrainer:
             torch.cuda.empty_cache()
         
         # Get current learning rate
-        current_lr = self.optimizer.param_groups[0]['lr']
+        try:
+            current_lr = self.scheduler.get_last_lr()[0]
+        except Exception:
+            current_lr = self.optimizer.param_groups[0]['lr']
         print(f'Current learning rate: {current_lr:.6f}')
         self.learning_rate_curve.append(current_lr)
         

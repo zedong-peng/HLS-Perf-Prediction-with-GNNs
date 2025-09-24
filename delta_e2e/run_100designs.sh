@@ -15,37 +15,53 @@ cleanup() {
 # 捕获中断信号（Ctrl+C）
 trap cleanup SIGINT SIGTERM
 
+
+
 features=("dsp" "lut" "ff")
-# features=("dsp")
+# features=("lut")
 # differentials=("true" "false")
 differentials=("false")
 # gnn=("gin" "gcn" "rgcn" "fast_rgcn")
 gnn=("gin")
+hierarchical=("on" "off")
+region=("on" "off")
+# hierarchical=("off")
 
+# 串行运行，减少总内存占用；并配置更保守的内存参数
 for differential in "${differentials[@]}"; do
   for feature in "${features[@]}"; do
-    echo "Running: $differential | $feature"
-    python train_e2e.py \
-    --kernel_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_kernels \
-    --design_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_lite_100designs \
-    --ood_design_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_benchmark \
-    --output_dir ./output \
-    --cache_root ./graph_cache \
-    --gnn_type gin \
-    --epochs 300 \
-    --batch_size 32 \
-    --hidden_dim 64 \
-    --num_layers 2 \
-    --dropout 0.1 \
-    --lr 1e-3 \
-    --grad_accum_steps 1 \
-    --warmup_epochs 5 \
-    --target_metric $feature \
-    --differential $differential &
+    for gnn_type in "${gnn[@]}"; do
+      for h in "${hierarchical[@]}"; do
+        for r in "${region[@]}"; do
+          echo "Running: $differential | $feature | $gnn_type | $h | $r"
+          python train_e2e.py \
+          --kernel_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_kernels \
+          --design_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_lite_100designs \
+          --ood_design_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_benchmark \
+          --output_dir ./output \
+          --cache_root ./graph_cache \
+          --gnn_type $gnn_type \
+          --epochs 300 \
+          --batch_size 32 \
+          --hidden_dim 64 \
+          --num_layers 2 \
+          --dropout 0.1 \
+          --lr 1e-3 \
+          --grad_accum_steps 1 \
+          --warmup_epochs 5 \
+          --target_metric $feature \
+          --hierarchical $h \
+          --region $r \
+          --differential false \
+          --loader_workers 0 \
+          --prefetch_factor 1 \
+          --persistent_workers false \
+          --pin_memory false
+        done
+      done
+    done
   done
 done
-
-# 等待所有后台任务完成
 wait
 
 echo "所有训练任务已完成！"
