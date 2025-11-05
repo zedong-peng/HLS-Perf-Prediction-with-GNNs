@@ -7,19 +7,24 @@ cd "$(dirname "$0")/"
 # 定义清理函数，用于捕获中断信号
 cleanup() {
     echo "接收到中断信号，正在终止所有后台进程..."
-    # 杀死所有子进程
-    pkill -P $$
-    exit 1
+    # 先移除 trap，避免递归触发
+    trap - SIGINT SIGTERM EXIT
+    # 向整个进程组发送终止信号，尽量优雅退出
+    kill -- -$$ 2>/dev/null || true
+    sleep 0.5
+    # 若仍未退出，强制终止
+    kill -KILL -- -$$ 2>/dev/null || true
+    exit 130
 }
 
 # 捕获中断信号（Ctrl+C）
-trap cleanup SIGINT SIGTERM
+trap cleanup SIGINT SIGTERM EXIT
 
 
 # 预热缓存（on/off 组合 各一次，epochs=0 仅构建缓存与配对）
 # 注意：这里没有 target_metric，因为构建图时不需要考虑目标指标
 
-for h in on off; do
+for h in off; do
   for r in on off; do
     python train_e2e.py \
       --kernel_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_kernels \
@@ -34,12 +39,11 @@ for h in on off; do
       --hierarchical $h \
       --region $r \
       --max_workers 100 \
-      --differential false &
+      --differential true
   done
 done
 wait
 
 # 等待所有后台任务完成
-wait
 
 echo "所有训练任务已完成！"

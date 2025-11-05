@@ -17,18 +17,20 @@ trap cleanup SIGINT SIGTERM
 
 
 
-features=("lut" "dsp" "ff")
+features=("lut" "ff" "dsp")
 # features=("dsp")
 
-# differentials=("true" "false")
-differentials=("true")
+differentials=("false")
+
 # gnn=("gin" "gcn" "rgcn" "fast_rgcn")
-gnn=("gcn")
+gnn=("gin")
+
 hierarchical=("off")
-region=("on")
+region=("off")
 
 
 # 串行运行，减少总内存占用；并配置更保守的内存参数
+# 4090 当前配置下可稳定执行3个训练任务
 for differential in "${differentials[@]}"; do
   for feature in "${features[@]}"; do
     for gnn_type in "${gnn[@]}"; do
@@ -37,26 +39,24 @@ for differential in "${differentials[@]}"; do
           echo "Running: $differential | $feature | $gnn_type | $h | $r"
           python train_e2e.py \
           --kernel_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_kernels \
-          --design_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_lite_10designs \
+          --design_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_lite_100designs \
           --ood_design_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_benchmark \
           --output_dir ./output \
           --cache_root ./graph_cache \
           --gnn_type $gnn_type \
-          --epochs 100 \
+          --epochs 300 \
           --batch_size 32 \
           --hidden_dim 64 \
           --num_layers 2 \
           --dropout 0.1 \
           --lr 1e-3 \
-          --loss_type mse \
-          --normalize true \
           --grad_accum_steps 1 \
           --warmup_epochs 5 \
           --target_metric $feature \
           --hierarchical $h \
           --region $r \
-          --differential false \
-          --kernel_baseline learned \
+          --differential $differential \
+          --kernel_baseline oracle \
           --loader_workers 0 \
           --prefetch_factor 1 \
           --persistent_workers false \
