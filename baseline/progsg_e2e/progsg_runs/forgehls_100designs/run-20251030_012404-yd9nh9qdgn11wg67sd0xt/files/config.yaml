@@ -1,0 +1,164 @@
+batch_size:
+  desc: ''
+  sort: 7
+  value: 32
+cache_root:
+  desc: ''
+  sort: 2
+  value: /home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/progsg_e2e/progsg_cache
+code_cache_device:
+  desc: ''
+  sort: 36
+  value: cuda
+code_cache_namespace:
+  desc: ''
+  sort: 34
+  value: codet5_small_v1
+code_encoder_name:
+  desc: ''
+  sort: 32
+  value: Salesforce/codet5-small
+code_fusion_mode:
+  desc: ''
+  sort: 39
+  value: concat
+code_local_files_only:
+  desc: ''
+  sort: 35
+  value: true
+code_max_length:
+  desc: ''
+  sort: 33
+  value: 64
+code_node_interaction:
+  desc: ''
+  sort: 40
+  value: true
+code_transformer_heads:
+  desc: ''
+  sort: 38
+  value: 8
+code_transformer_layers:
+  desc: ''
+  sort: 37
+  value: 4
+design_base_dir:
+  desc: ''
+  sort: 0
+  value: /home/user/zedongpeng/workspace/Huggingface/forgehls_lite_100designs
+device:
+  desc: ''
+  sort: 20
+  value: cuda
+dropout:
+  desc: ''
+  sort: 14
+  value: 0.1
+enable_code:
+  desc: ''
+  sort: 31
+  value: true
+epochs:
+  desc: ''
+  sort: 8
+  value: 2
+heads:
+  desc: ''
+  sort: 13
+  value: 8
+hidden_dim:
+  desc: ''
+  sort: 11
+  value: 128
+hierarchical:
+  desc: ''
+  sort: 5
+  value: false
+lr:
+  desc: ''
+  sort: 9
+  value: 0.0004
+lr_gamma:
+  desc: ''
+  sort: 26
+  value: 0.5
+lr_min:
+  desc: ''
+  sort: 24
+  value: 1.0e-06
+lr_plateau_factor:
+  desc: ''
+  sort: 28
+  value: 0.5
+lr_plateau_patience:
+  desc: ''
+  sort: 27
+  value: 15
+lr_scheduler:
+  desc: ''
+  sort: 23
+  value: plateau
+lr_step_size:
+  desc: ''
+  sort: 25
+  value: 50
+lr_warmup_epochs:
+  desc: ''
+  sort: 29
+  value: 20
+lr_warmup_start_factor:
+  desc: ''
+  sort: 30
+  value: 0.1
+max_designs:
+  desc: ''
+  sort: 18
+  value: 2048
+max_grad_norm:
+  desc: ''
+  sort: 15
+  value: 2.0
+num_layers:
+  desc: ''
+  sort: 12
+  value: 2
+num_workers:
+  desc: ''
+  sort: 19
+  value: 4
+ood_design_base_dir:
+  desc: ''
+  sort: 3
+  value: /home/user/zedongpeng/workspace/Huggingface/forgehls_benchmark
+output_dir:
+  desc: ''
+  sort: 1
+  value: /home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/progsg_e2e/progsg_runs/forgehls_100designs
+rebuild_cache:
+  desc: ''
+  sort: 4
+  value: false
+region:
+  desc: ''
+  sort: 6
+  value: false
+seed:
+  desc: ''
+  sort: 21
+  value: 42
+train_ratio:
+  desc: ''
+  sort: 16
+  value: 0.7
+use_swanlab:
+  desc: ''
+  sort: 22
+  value: true
+valid_ratio:
+  desc: ''
+  sort: 17
+  value: 0.2
+weight_decay:
+  desc: ''
+  sort: 10
+  value: 0.0001
