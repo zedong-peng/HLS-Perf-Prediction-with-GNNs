@@ -99,6 +99,23 @@ AVAILABLE_RESOURCES = {
 }
 
 
+LOSS_FUNCTION_REGISTRY = {
+    'mae': F.l1_loss,
+    'mse': F.mse_loss,
+    'smoothl1': F.smooth_l1_loss,
+    'smooth_l1': F.smooth_l1_loss  # alias for convenience
+}
+
+
+def resolve_loss_function(loss_type: str):
+    """Return a PyTorch loss callable based on a string identifier."""
+    key = (loss_type or 'mae').lower()
+    if key not in LOSS_FUNCTION_REGISTRY:
+        supported = ', '.join(sorted({k for k in LOSS_FUNCTION_REGISTRY if '_' not in k}))
+        raise ValueError(f"Unsupported loss_type '{loss_type}'. Supported losses: {supported}")
+    return LOSS_FUNCTION_REGISTRY[key]
+
+
 # ============================================================================
 # Data Collection and Pairing
 # ============================================================================
@@ -793,10 +810,18 @@ class SimpleDifferentialGNN(nn.Module):
                 self.convs.append(GCNConv(hidden_dim, hidden_dim))
             elif self.gnn_type == 'gin':
                 # GIN需要一个MLP作为参数
+                # 添加LayerNorm以稳定梯度流，避免激活分布偏移
+                # LayerNorm对特征维度归一化，不依赖batch大小，适合图数据
+                # 模式: Linear -> LayerNorm -> ReLU -> Linear
+                # 
+                # 重要经验：如果不加LayerNorm，GIN在DSP任务上loss基本不下降，无法正常学习
+                # 这是因为GIN的MLP缺少归一化导致梯度流不稳定，激活分布偏移
                 mlp = nn.Sequential(
                     nn.Linear(hidden_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),  # 归一化后激活，稳定第一层的梯度
                     nn.ReLU(),
                     nn.Linear(hidden_dim, hidden_dim)
+                    # 最后一层不添加LayerNorm，因为GIN层后还有全局LayerNorm
                 )
                 self.convs.append(GINConv(mlp))
             elif self.gnn_type == 'rgcn':
@@ -846,6 +871,7 @@ class SimpleDifferentialGNN(nn.Module):
             if self.kernel_baseline == 'learned':
                 self.kernel_head = _make_head(hidden_dim)
             # delta 头融合多种交互项
+            self.delta_input_norm = nn.LayerNorm(hidden_dim * 4)
             self.delta_head = _make_head(hidden_dim * 4)
         else:
             # 直接预测头
@@ -928,6 +954,8 @@ class SimpleDifferentialGNN(nn.Module):
                 design_repr - kernel_repr,
                 design_repr * kernel_repr
             ], dim=-1)
+            delta_input = self.delta_input_norm(delta_input) # add layer norm to delta input, avoid gradient explosion in DSP training.
+
             delta_pred = self.delta_head(delta_input)
 
             design_pred = kernel_pred + delta_pred
@@ -1014,9 +1042,10 @@ def differential_collate_fn(batch):
 # Training Functions
 # ============================================================================
 
-def train_epoch(model, device, train_loader, optimizer, grad_accum_steps=1, max_grad_norm=1.0):
+def train_epoch(model, device, train_loader, optimizer, loss_fn=None, grad_accum_steps=1, max_grad_norm=1.0):
     """训练一个epoch"""
     model.train()
+    loss_fn = loss_fn or F.l1_loss
     loss_sum_gpu = torch.zeros(1, device=device)
     batch_count = 0
     
@@ -1040,13 +1069,22 @@ def train_epoch(model, device, train_loader, optimizer, grad_accum_steps=1, max_
         
         if model.differential:
             design_pred = predictions['design_pred'].squeeze()
-            target_values = targets['design_perf'].squeeze()
+            delta_pred = predictions['delta_pred'].squeeze()
+            kernel_pred = predictions['kernel_pred'].squeeze()
+
+            target_design = targets['design_perf'].squeeze()
+            target_delta = targets['performance_delta'].squeeze()
+            target_kernel = targets['kernel_perf'].squeeze()
+
+            design_loss = loss_fn(design_pred, target_design)
+            delta_loss = loss_fn(delta_pred, target_delta)
+            kernel_loss = loss_fn(kernel_pred, target_kernel)
+
+            loss = kernel_loss + delta_loss + 0.2 * design_loss
         else:
             design_pred = predictions['direct_pred'].squeeze()
-            target_values = targets['design_perf'].squeeze()
-
-        # 计算原始值空间的损失 (MAE) - 针对设计指标
-        loss = F.l1_loss(design_pred, target_values)
+            target_design = targets['design_perf'].squeeze()
+            loss = loss_fn(design_pred, target_design)
         
         # 梯度累积缩放
         loss_scaled = loss / max(1, grad_accum_steps)
@@ -1069,9 +1107,10 @@ def train_epoch(model, device, train_loader, optimizer, grad_accum_steps=1, max_
     return (loss_sum_gpu.item() / batch_count) if batch_count > 0 else float('inf')
 
 
-def evaluate_model(model, data_loader, device, target_metric='dsp', return_predictions=False):
+def evaluate_model(model, data_loader, device, target_metric='dsp', return_predictions=False, loss_fn=None):
     """评估模型性能 - 返回设计绝对指标并可选记录差值诊断信息"""
     model.eval()
+    loss_fn = loss_fn or F.l1_loss
     total_loss = 0
     batch_count = 0
 
@@ -1108,6 +1147,11 @@ def evaluate_model(model, data_loader, device, target_metric='dsp', return_predi
                 target_design = targets['design_perf'].squeeze()
                 delta_true = targets['performance_delta'].squeeze()
                 kernel_true = targets['kernel_perf'].squeeze()
+
+                design_loss = loss_fn(design_pred, target_design)
+                delta_loss = loss_fn(delta_pred, delta_true)
+                kernel_loss = loss_fn(kernel_pred, kernel_true)
+                total_batch_loss = kernel_loss + delta_loss + 0.2 * design_loss
             else:
                 design_pred = predictions['direct_pred'].squeeze()
                 target_design = targets['design_perf'].squeeze()
@@ -1116,9 +1160,8 @@ def evaluate_model(model, data_loader, device, target_metric='dsp', return_predi
                 kernel_pred = None
                 kernel_true = None
 
-            # 计算原始值空间的损失（针对设计指标）
-            loss = F.l1_loss(design_pred, target_design)
-            total_batch_loss = loss
+                design_loss = loss_fn(design_pred, target_design)
+                total_batch_loss = design_loss
 
             total_loss += total_batch_loss.item()
             batch_count += 1
@@ -1278,14 +1321,14 @@ def main():
                         default='/home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/Graphs/forgehls_kernels/',
                         help='Kernel数据根目录')
     parser.add_argument('--design_base_dir', type=str,
-                        default='/home/user/zedongpeng/workspace/Huggingface/forgehls_lite_10designs/',
+                        default=None,
                         help='Design数据根目录')
     parser.add_argument('--ood_design_base_dir', type=str,
-                        default='/home/user/zedongpeng/workspace/Huggingface/forgehls_benchmark',
+                        default=None,
                         help='OOD Design数据根目录（可选，不存在则跳过 OOD 评估）')
     
     # 模型参数
-    parser.add_argument('--target_metric', type=str, default='dsp',
+    parser.add_argument('--target_metric', type=str, default=None,
                         choices=['dsp', 'lut', 'ff', 'latency'],
                         help='目标预测指标')
     parser.add_argument('--hidden_dim', type=int, default=128, help='隐藏层维度')
@@ -1303,6 +1346,9 @@ def main():
     parser.add_argument('--lr', type=float, default=0.001, help='学习率')
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
     parser.add_argument('--device', type=int, default=0, help='GPU设备ID')
+    parser.add_argument('--loss_type', type=str, default='mae',
+                        choices=['mae', 'mse', 'smoothl1'],
+                        help='训练与评估时使用的损失函数')
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='梯度累积步数（>1 可提高有效批大小）')
     parser.add_argument('--loader_workers', type=int, default=8, help='DataLoader worker 数量（>0 启用多进程加载）')
     parser.add_argument('--prefetch_factor', type=int, default=4, help='DataLoader 预取批数（num_workers>0 时有效）')
@@ -1348,6 +1394,8 @@ def main():
                         help='是否保存最终epoch的模型（默认只保存best model，学术论文通常使用best model）')
     
     args = parser.parse_args()
+    args.loss_type = args.loss_type.lower()
+    loss_fn = resolve_loss_function(args.loss_type)
     
     # 设置设备
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
@@ -1414,6 +1462,7 @@ def main():
     swanlab.log({
         "config/kernel_baseline_mode": 0 if args.kernel_baseline.lower() == 'learned' else 1
     })
+    swanlab.log({"config/loss_type": args.loss_type})
     # 记录流水线旁证的总体占比（设计图）
     try:
         has_pipe_count = sum(int(getattr(p['design_graph'], 'has_pipeline', 0)) for p in pairs)
@@ -1628,13 +1677,15 @@ def main():
         # 训练
         train_loss = train_epoch(
             model, device, train_loader, optimizer,
+            loss_fn=loss_fn,
             grad_accum_steps=args.grad_accum_steps
         )
         train_losses.append(train_loss)
         
         # 验证
         valid_metrics = evaluate_model(
-            model, valid_loader, device, args.target_metric
+            model, valid_loader, device, args.target_metric,
+            loss_fn=loss_fn
         )
         valid_loss = valid_metrics['avg_loss']
         valid_losses.append(valid_loss)
@@ -1642,7 +1693,8 @@ def main():
         
         # ID 测试
         id_test_metrics = evaluate_model(
-            model, test_loader, device, args.target_metric
+            model, test_loader, device, args.target_metric,
+            loss_fn=loss_fn
         )
         id_test_loss = id_test_metrics['avg_loss']
         test_losses.append(id_test_loss)
@@ -1652,7 +1704,8 @@ def main():
         ood_test_metrics = None
         if ood_test_loader is not None:
             ood_test_metrics = evaluate_model(
-                model, ood_test_loader, device, args.target_metric
+                model, ood_test_loader, device, args.target_metric,
+                loss_fn=loss_fn
             )
             ood_metrics_history.append(ood_test_metrics)
         
@@ -1778,7 +1831,10 @@ def main():
         
         # 如果 OOD 可用，也记录最佳 epoch 对应的 OOD 指标（同一 epoch 下）
         if 'ood_test_loader' in locals() and ood_test_loader is not None:
-            best_ood_metrics = evaluate_model(model, ood_test_loader, device, args.target_metric)
+            best_ood_metrics = evaluate_model(
+                model, ood_test_loader, device, args.target_metric,
+                loss_fn=loss_fn
+            )
             swanlab.log({
                 "final/ood_design_mae": best_ood_metrics.get('design_mae', 0),
                 "final/ood_design_rmse": best_ood_metrics.get('design_rmse', 0),
