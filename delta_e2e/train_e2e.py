@@ -661,6 +661,7 @@ class E2EDifferentialProcessor:
                     'kernel_info': {k: v for k, v in pair['kernel_info'].items() if k != 'graph'},
                     'design_info': {k: v for k, v in pair['design_info'].items() if k != 'graph'}
                 }
+                is_valid = self._is_pair_payload_valid(payload)
 
                 pair_file = f"pairs/{pair['pair_id']}.pt"
                 torch.save(payload, os.path.join(self.graph_cache_dir, pair_file))
@@ -672,15 +673,45 @@ class E2EDifferentialProcessor:
                     'kernel_base_path': payload['kernel_info'].get('base_path'),
                     'pragma_count': int(payload['pragma_info'].get('pragma_count', 0)),
                     'design_num_nodes': int(design_graph.num_nodes),
-                    'kernel_num_nodes': int(kernel_graph.num_nodes)
+                    'kernel_num_nodes': int(kernel_graph.num_nodes),
+                    'is_valid': bool(is_valid)
                 }
                 index_f.write(json.dumps(meta, ensure_ascii=False) + "\n")
 
         os.replace(tmp_index_path, self.index_path)
 
+    def _is_performance_within_available(self, perf: Optional[Dict]) -> bool:
+        """检查性能字典中的资源是否不超过可用上限"""
+        if not perf:
+            return True
+        for raw_key, raw_value in perf.items():
+            if not isinstance(raw_key, str):
+                continue
+            normalized_key = raw_key.lower()
+            if normalized_key not in AVAILABLE_RESOURCES:
+                continue
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if value > AVAILABLE_RESOURCES[normalized_key]:
+                return False
+        return True
+
+    def _is_pair_payload_valid(self, payload: Dict) -> bool:
+        """判定缓存样本是否满足资源限制"""
+        kernel_perf = payload.get('kernel_info', {}).get('performance')
+        design_perf = payload.get('design_info', {}).get('performance')
+        if not self._is_performance_within_available(kernel_perf):
+            return False
+        if not self._is_performance_within_available(design_perf):
+            return False
+        return True
+
     def _load_cached_pairs(self, limit: Optional[int] = None, materialize: bool = True) -> List[Dict]:
         """从缓存加载配对数据（流式）"""
         records: List[Dict] = []
+        filtered_out = 0
 
         if os.path.exists(self.index_path):
             with open(self.index_path, 'r', encoding='utf-8') as index_f:
@@ -694,15 +725,36 @@ class E2EDifferentialProcessor:
                             continue
                         try:
                             payload = torch.load(pair_path, map_location='cpu')
+                            if not self._is_pair_payload_valid(payload):
+                                filtered_out += 1
+                                continue
                             records.append(payload)
                         except Exception:
                             continue
                     else:
-                        entry['file'] = os.path.join(self.graph_cache_dir, entry['file'])
+                        pair_path = os.path.join(self.graph_cache_dir, entry['file'])
+                        if not os.path.exists(pair_path):
+                            continue
+                        entry['file'] = pair_path
+                        is_valid = entry.get('is_valid')
+                        if is_valid is False:
+                            filtered_out += 1
+                            continue
+                        if is_valid is None:
+                            try:
+                                payload = torch.load(pair_path, map_location='cpu')
+                            except Exception:
+                                filtered_out += 1
+                                continue
+                            if not self._is_pair_payload_valid(payload):
+                                filtered_out += 1
+                                continue
                         records.append(entry)
 
                     if limit is not None and len(records) >= limit:
                         break
+            if filtered_out > 0:
+                print(f"过滤资源超限的缓存样本: {filtered_out}")
             return records
 
         # 兜底：无新格式索引，返回空列表
@@ -762,6 +814,9 @@ class E2EDifferentialProcessor:
                     'kernel_info': cached_pair['kernel_info'],
                     'design_info': cached_pair['design_info']
                 }
+
+                if not self._is_pair_payload_valid(pair):
+                    continue
 
                 pairs.append(pair)
 
