@@ -26,14 +26,16 @@ from typing import Any
 try:
     from delta_e2e.train_e2e import (
         E2EDifferentialProcessor, SimpleDifferentialGNN, 
-        E2EDifferentialDataset, evaluate_model, differential_collate_fn
+        E2EDifferentialDataset, evaluate_model, differential_collate_fn,
+        resolve_loss_function
     )
 except ImportError:
     # 如果作为模块导入失败，使用相对导入
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from train_e2e import (
         E2EDifferentialProcessor, SimpleDifferentialGNN,
-        E2EDifferentialDataset, evaluate_model, differential_collate_fn
+        E2EDifferentialDataset, evaluate_model, differential_collate_fn,
+        resolve_loss_function
     )
 
 
@@ -135,6 +137,9 @@ def main():
                         help='忽略已有缓存并重新构建')
     parser.add_argument('--max_workers', type=int, default=-1,
                         help='数据处理并行线程数（<=0表示自动）')
+    parser.add_argument('--loss_type', type=str, default=None,
+                        choices=['mae', 'mse', 'smoothl1'],
+                        help='评估时使用的损失函数（默认使用模型训练时的配置）')
     
     args = parser.parse_args()
     
@@ -147,6 +152,10 @@ def main():
     
     # 从保存的模型配置中自动加载所有超参数
     kernel_base_dir = saved_args.get('kernel_base_dir', args.kernel_base_dir)
+    loss_type = (args.loss_type if args.loss_type is not None else saved_args.get('loss_type', 'mae'))
+    loss_type = str(loss_type).lower()
+    loss_fn = resolve_loss_function(loss_type)
+    args.loss_type = loss_type
     
     # 自动从模型配置加载hierarchical和region（训练时保存的配置）
     # 不设置默认值；若缺失直接报错
@@ -175,6 +184,7 @@ def main():
     print(f"自动加载模型配置: hierarchical={hierarchical_flag}, region={region_flag}")
     target_metric = model_config['target_metric']
     print(f"评估目标指标: {target_metric.upper()}（与训练配置保持一致）")
+    print(f"评估损失函数: {loss_type}")
     
     # 如果没有提供output_dir，使用模型所在目录
     if args.output_dir is None:
@@ -267,7 +277,8 @@ def main():
     metrics = evaluate_model(
         model, eval_loader, device, 
         target_metric=model_config['target_metric'],
-        return_predictions=False
+        return_predictions=False,
+        loss_fn=loss_fn
     )
     
     # ==================== 保存结果 ====================
@@ -301,6 +312,7 @@ def main():
         'eval_data_dir': args.ood_design_base_dir,
         'num_pairs': len(eval_pairs),
         'target_metric': target_metric,
+        'loss_type': loss_type,
         'metrics': to_serializable({k: v for k, v in metrics.items()}),
         'model_config': model_config,
         'eval_config': vars(args)
