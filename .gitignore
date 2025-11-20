@@ -23,6 +23,7 @@ baseline/IRON-MAN-PRO
 baseline/ProgSG_origin
 baseline/progsg_e2e/progsg_cache
 baseline/progsg_e2e/progsg_runs
+baseline/HGNN/origin/
 
 delta_e2e/graph_cache
 graph_cache
