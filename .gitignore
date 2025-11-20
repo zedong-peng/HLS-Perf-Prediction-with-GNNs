@@ -15,3 +15,13 @@ Graphs/forgehls_kernels
 GNN/src/differential_output_e2e
 GNN/differential_output_e2e
 GNN/graph_cache
+
+baseline/GNN-DSE
+baseline/HARP_origin
+baseline/HLS-Perf-Prediction-with-GNNs-origin
+baseline/IRON-MAN-PRO
+baseline/ProgSG_origin
+baseline/progsg_e2e/progsg_cache
+baseline/progsg_e2e/progsg_runs
+
+delta_e2e/graph_cache

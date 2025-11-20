@@ -23,7 +23,7 @@ features=("lut" "dsp" "ff")
 # differentials=("true" "false")
 differentials=("true")
 # gnn=("gin" "gcn" "rgcn" "fast_rgcn")
-gnn=("gcn")
+gnn=("gin")
 hierarchical=("off")
 region=("on")
 
@@ -48,8 +48,6 @@ for differential in "${differentials[@]}"; do
           --num_layers 2 \
           --dropout 0.1 \
           --lr 1e-3 \
-          --loss_type mse \
-          --normalize true \
           --grad_accum_steps 1 \
           --warmup_epochs 5 \
           --target_metric $feature \

@@ -23,7 +23,7 @@ features=("lut" "ff" "dsp")
 differentials=("false")
 
 # gnn=("gin" "gcn" "rgcn" "fast_rgcn")
-gnn=("gin")
+gnn=("pna")
 
 hierarchical=("off")
 region=("off")
@@ -44,11 +44,11 @@ for differential in "${differentials[@]}"; do
           --output_dir ./output \
           --cache_root ./graph_cache \
           --gnn_type $gnn_type \
-          --epochs 300 \
+          --epochs 200 \
           --batch_size 32 \
-          --hidden_dim 64 \
+          --hidden_dim 128 \
           --num_layers 2 \
-          --dropout 0.1 \
+          --dropout 0.05 \
           --lr 1e-3 \
           --grad_accum_steps 1 \
           --warmup_epochs 5 \

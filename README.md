@@ -42,6 +42,26 @@ flowchart TB
 
 ```
 
+## ForgeHLS Dataset Assets
+- Latest dataset snapshot lives in `/home/user/zedongpeng/workspace/Huggingface/forgehls`, mirrored from the public Hugging Face repo.
+- Detailed design dumps are packaged under `/home/user/zedongpeng/workspace/Huggingface/forgehls/designs/design_package`, grouped by benchmark suite (`CHStone.tar.gz`, `MachSuite.tar.gz`, `PolyBench.tar.gz`, `hls_algorithms.tar.gz`, `leetcode_hls_algorithms.tar.gz`, `operators.tar.gz`, `rosetta.tar.gz`, `rtl_chip.tar.gz`, `rtl_ip.tar.gz`, `rtl_module.tar.gz`, `Vitis-HLS-Introductory-Examples-flatten.tar.gz`, `Vitis_Libraries.tar.gz`).
+- Each archive expands back into the original directory hierarchy; extract with `tar -xzf <archive> -C <target_dir>` before pointing `--design_base_dir` to the unpacked root.
+- Helper scripts in the same folder (`analyze_kernel_designs.py`, `analyze_cpp_tokens.py`, etc.) summarise pragma counts, token stats, and kernel/design pairings for quick sanity checks.
+
+### Citation
+Please cite the ForgeHLS release when using these assets:
+
+```bibtex
+@misc{peng2025forgehls,
+    title={ForgeHLS: A Large-Scale, Open-Source Dataset for High-Level Synthesis},
+    author={Zedong Peng and Zeju Li and Mingzhe Gao and Qiang Xu and Chen Zhang and Jieru Zhao},
+    year={2025},
+    eprint={2507.03255},
+    archivePrefix={arXiv},
+    primaryClass={cs.AR}
+}
+```
+
 ## Training on PolyBench
 generate dataset:
 ```

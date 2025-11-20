@@ -17,22 +17,32 @@ trap cleanup SIGINT SIGTERM
 
 
 
-features=("lut" "dsp" "ff" )
-# features=("dsp")
+# features=("ff" "dsp" "lut")
+features=("ff" "dsp")
 
 differentials=("true")
+hierarchical=("off")
+region=("on")
+
+# differentials=("false")
+# hierarchical=("off")
+# region=("off")
 
 # from fast to slow
 # gnn=("gcn" "fast_rgcn" "rgcn" "gin" "pna")
 
-gnn=("gin")
+gnn=("pna")
 
-hierarchical=("off")
-region=("on")
 
+# design_base_dir
+# design_base_dir=("/home/user/zedongpeng/workspace/Huggingface/forgehls_lite_100designs")
+# design_base_dir=("/home/user/zedongpeng/workspace/Huggingface/forgehls_PolyBench_part_250designs")
+design_base_dir=("/home/user/zedongpeng/workspace/Huggingface/new_polybench_without_attribution_pragma_50designs")
 
 # 串行运行，减少总内存占用；并配置更保守的内存参数
 # 4090 当前配置下可稳定执行3个训练任务
+# --ood_design_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_benchmark \
+
 for differential in "${differentials[@]}"; do
   for feature in "${features[@]}"; do
     for gnn_type in "${gnn[@]}"; do
@@ -41,12 +51,11 @@ for differential in "${differentials[@]}"; do
           echo "Running: $differential | $feature | $gnn_type | $h | $r"
           python train_e2e.py \
           --kernel_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_kernels \
-          --design_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_lite_100designs \
-          --ood_design_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_benchmark \
+          --design_base_dir $design_base_dir \
           --output_dir ./output \
           --cache_root ./graph_cache \
           --gnn_type $gnn_type \
-          --epochs 200 \
+          --epochs 600 \
           --batch_size 32 \
           --hidden_dim 128 \
           --num_layers 2 \
@@ -59,6 +68,7 @@ for differential in "${differentials[@]}"; do
           --region $r \
           --differential $differential \
           --kernel_baseline learned \
+          --loss_type mae \
           --loader_workers 0 \
           --prefetch_factor 1 \
           --persistent_workers false \
