@@ -1,77 +1,85 @@
-# Conditional Graph Diffusion (PoC)
+# 废案 NOT WORKING
 
-This directory contains a minimal, working proof-of-concept to generate design node features conditioned on kernel graph and code. It reuses existing pair cache and logging flow.
+# Conditional Graph Diffusion
 
-## What it does now (PoC)
-- Input conditions:
-  - Kernel graph node features pooled to a global vector, broadcast to design node count
-  - Lightweight kernel code statistics vector (16-d) extracted from C/C++ sources and broadcast per node
-- Output: generated design node feature tensor (same feature dim, variable node count via padding)
-- Structure: fixed (no edge/node additions yet)
-- Data: reuses `E2EDifferentialProcessor` cached kernel/design pairs
-- Training: Gaussian diffusion on continuous node features with a per-node conditional denoiser (MLP)
-- Logging/ckpt: SwanLab + best checkpoint saved under `runs/`
+End-to-end diffusion pipeline that generates complete design graphs (nodes + adjacency + edge attributes) from kernel graphs and design code statistics, then evaluates the generated graph quality and feeds it into the existing QoR predictor.
 
-## Repo integration
-- Code lives under `delta_e2e/gen/`
-  - `data.py`: dataset + collate; loads cached pairs and builds conditions (graph pooled + code stats)
-  - `model_diffusion.py`: conditional denoiser and Gaussian diffusion utilities
-  - `train_graph_diffusion.py`: training entry
-  - `sample.py`: sampling entry, saves generated node features to JSON
+## Components
+- `data.py` – loads cached kernel/design pairs, builds dense edge tensors, extracts code features from each design directory, and exposes masks for variable-size graphs.
+- `model_diffusion.py` – joint node/edge denoiser and Gaussian diffusion utilities.
+- `train_graph_diffusion.py` – training entry point with joint node/edge losses and optional SwanLab logging.
+- `inference.py` – helpers for loading checkpoints and sampling conditioned graphs.
+- `metrics.py` – structural and feature-level metrics (MAE/RMSE, precision/recall/F1, degree/density gaps, edge-attribute scores).
+- `sample.py` – generates graphs, reports quality metrics, and exports JSON artefacts.
+- `predict_qor_with_generated.py` – plugs a generated graph into the delta_e2e QoR model to estimate resource/latency metrics.
 
-## Environment
-- Use conda env: `circuitnet`
-- For any Python command, prefer: `conda activate circuitnet && python <script>`
-
-## Quick start
-- Train (small smoke):
+## Quick Start
+Activate the project environment before running any command:
 ```bash
 cd /home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs
-conda activate circuitnet && python -m delta_e2e.gen.train_graph_diffusion \
-  --epochs 1 --batch_size 4 --max_pairs 200 --loader_workers 0
+conda activate circuitnet
 ```
-- Sample:
+
+### Train the diffusion model
 ```bash
-conda activate circuitnet && python -m delta_e2e.gen.sample \
-  --checkpoint /home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/delta_e2e/gen/runs/attr_diffusion_*/best_attr_diffusion.pt \
-  --pair_index 0
+python -m delta_e2e.gen.train_graph_diffusion \
+  --epochs 5 \
+  --batch_size 4 \
+  --max_pairs 200 \
+  --loader_workers 0
 ```
-- Outputs:
-  - Runs: `delta_e2e/gen/runs/attr_diffusion_*/`
-  - Samples: `delta_e2e/gen/samples/gen_attr_*.json`
+Checkpoints are stored under `delta_e2e/gen/runs/graph_diffusion_*`. Pass `--use_swanlab` to enable online logging (requires SwanLab and network access).
 
-## Current limitations
-- Only node feature generation; graph structure is fixed
-- Kernel code condition is a heuristic 16-d statistics vector (not a learned code encoder)
-- No performance-aware guidance yet (pure diffusion loss)
+### Train node-only diffusion
+When you only want to denoise node features (no adjacency/edge channels), enable the dedicated flag:
+```bash
+python -m delta_e2e.gen.train_graph_diffusion \
+  --nodes_only \
+  --epochs 5 \
+  --batch_size 4
+```
+This automatically masks out edge losses/metrics while still emitting node-quality scores during evaluation.
 
-## Roadmap
-- Stage 1: Better conditioning and controllability
-  - Add target constraints: desired Δ(dsp/lut/ff/latency) or budgets as extra conditions
-  - Guidance: plug in existing differential predictor (from `delta_e2e/train_e2e.py`) to guide sampling toward target metrics (classifier/classifier-free guidance)
-  - Cache code features in `graph_cache` to avoid recomputation
+### Sample a design graph and inspect metrics
+```bash
+python -m delta_e2e.gen.sample \
+  --checkpoint delta_e2e/gen/runs/graph_diffusion_*/best_graph_diffusion.pt \
+  --pair_index 0 \
+  --edge_threshold 0.55 \
+  --include_target
+```
+Outputs live in `delta_e2e/gen/samples/gen_graph_*.json` and include:
+- generated node features, adjacency logits/probabilities, and edge attributes
+- sparse edge list (`edge_index`, `edge_attr`)
+- graph quality metrics computed against the reference design graph
 
-- Stage 2: Structure-aware generation
-  - Move from fixed-structure to local edit diffusion (node/edge add/remove masks)
-  - Constrain connectivity and region-level semantics; support hierarchical graphs (enable `--hierarchical on` path in parsing)
-  - Node alignment via anchors (names/regions) to mitigate permutation instability
+### Predict QoR with a generated graph
+```bash
+python -m delta_e2e.gen.predict_qor_with_generated \
+  --diffusion_ckpt delta_e2e/gen/runs/graph_diffusion_*/best_graph_diffusion.pt \
+  --qor_ckpt delta_e2e/output/best_e2e_delta_dsp_model.pt \
+  --pair_index 0 \
+  --edge_threshold 0.55
+```
+The script samples a graph, converts it into a `torch_geometric.data.Data` object, and runs the saved delta_e2e GNN checkpoint to estimate QoR. A JSON summary containing predicted/ground-truth metrics and graph quality scores is written to `delta_e2e/gen/runs/qor_eval_*.json`.
 
-- Stage 3: Stronger code conditioning
-  - Replace statistics with learned encoders: GraphCodeBERT / CodeT5+ / AST/CFG GNN
-  - Cross-attention between code embeddings and node embeddings in the denoiser
+## Graph Quality Metrics
+`metrics.py` computes:
+- **node_feature_mae / rmse / cosine** – compare generated and reference node embeddings under the valid-node mask
+- **adjacency_mae / precision / recall / f1** – evaluate binary structure after thresholding `sigmoid(logits)` at the requested edge threshold
+- **degree_l1, density_abs** – capture distribution-level deviations
+- **edge_attr_mae / cosine** – only when edge attributes exist; evaluated on edges present in the ground-truth graph
 
-- Stage 4: Evaluation and E2E loop
-  - Metrics: validity rate, edit distance, attr MAE/RMSE, diversity
-  - Performance verification: run differential predictor on generated graphs; sample subset for real HLS synth
-  - Close the loop: generate pragma suggestions and (optionally) patch code, then re-evaluate
+Metrics are returned as plain floats (or `null` when not applicable) and logged by both `sample.py` and `predict_qor_with_generated.py`.
 
-- Stage 5: Engineering & scaling
-  - Mixed precision (AMP), gradient checkpointing, distributed training
-  - Config files (YAML) and CLI parity with existing training scripts
-  - CI checks and unit tests for data, model, and sampling
+## Implementation Notes
+- Code features are extracted from the design directory (recursively walking for C/C++ files) to align with downstream QoR usage.
+- Dense edge tensors contain a binary adjacency channel plus original edge attributes; padding masks keep diffusion/training numerically stable for variable graph sizes.
+- Generation and QoR inference share the `inference.py` helpers to ensure consistent post-processing (masking, thresholding, sparse conversion).
 
-## Notes
-- Default data roots match the project rules:
-  - Kernel: `/home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/Graphs/forgehls_kernels/kernels/`
-  - Design: `/home/user/zedongpeng/workspace/Huggingface/forgehls_lite_10designs/`
-- You can override via CLI flags in the training/sampling scripts. 
+## Limitations & Next Steps
+- Edge sampling currently thresholds post-hoc; exploring differentiable relaxation or classifier-free guidance can improve graph validity.
+- Only design-level code statistics are used; replacing them with learned code encoders (GraphCodeBERT/CodeT5) remains future work.
+- QoR conditioning is one-shot; iterative correction or joint training with the QoR model is not yet implemented.
+
+Override data roots with `--kernel_base_dir` / `--design_base_dir` if needed; defaults match the repository layout.
