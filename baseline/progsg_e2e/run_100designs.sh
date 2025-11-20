@@ -19,7 +19,7 @@ CACHE_ROOT="${PROJECT_ROOT}/progsg_cache"
 MAX_DESIGNS=0  # 0 = use every available design
 DEVICE="cuda"
 BATCH_SIZE=32 # no effect on OOM
-EPOCHS=200
+EPOCHS=150
 LR="4e-4"
 LR_SCHEDULER="plateau"
 LR_MIN="1e-6"
@@ -73,6 +73,7 @@ CMD=(
   --code_transformer_heads "${CODE_TRANSFORMER_HEADS}"
   --code_fusion_mode "${CODE_FUSION_MODE}"
   --code_local_files_only
+  --eval_checkpoint last
   --use_swanlab
 )
 

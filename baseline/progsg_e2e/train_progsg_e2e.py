@@ -40,18 +40,64 @@ from torch_geometric.loader import DataLoader
 
 from dataset import (
     DesignGraphProcessor,
+    DesignSample,
     assign_sample_indices,
     attach_code_features,
 )
 from model import ProgSGStyleModel, ProgSGMultimodalModel, TARGET_NAMES
 from code_features import CodeEncoderConfig, SourceCodeFeatureCache
 from metrics import (
+    AVAILABLE_RESOURCES,
     compute_regression_metrics,
     finalize_stack,
     stack_results,
 )
 
 LOSS_TARGET_INDICES = tuple(idx for idx, name in enumerate(TARGET_NAMES) if name != "latency")
+
+
+def _is_metric_payload_valid(metrics: Dict[str, float]) -> bool:
+    """Ensure resource metrics do not exceed device capacities."""
+
+    if not metrics:
+        return False
+    for raw_key, raw_value in metrics.items():
+        normalized_key = raw_key.lower()
+        if normalized_key not in AVAILABLE_RESOURCES:
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if value > AVAILABLE_RESOURCES[normalized_key]:
+            return False
+    return True
+
+
+def _is_sample_payload_valid(sample: DesignSample) -> bool:
+    """Mirror delta_e2e cache validation on design-only samples."""
+
+    if not _is_metric_payload_valid(sample.metrics):
+        return False
+    graph_targets = getattr(sample.graph, "y", None)
+    if graph_targets is None:
+        return False
+    if not torch.isfinite(graph_targets).all():
+        return False
+    return True
+
+
+def _filter_invalid_samples(samples: List[DesignSample]) -> List[DesignSample]:
+    """Drop cached samples whose metrics exceed platform resources."""
+
+    valid_samples: List[DesignSample] = []
+    for sample in samples:
+        if _is_sample_payload_valid(sample):
+            valid_samples.append(sample)
+    filtered = len(samples) - len(valid_samples)
+    if filtered:
+        print(f"Filtered {filtered} cached design samples that violated resource limits.")
+    return valid_samples
 
 
 def report_numerical_issue(
@@ -318,9 +364,9 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--hidden_dim", type=int, default=256)
-    parser.add_argument("--num_layers", type=int, default=4)
-    parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument("--hidden_dim", type=int, default=512)
+    parser.add_argument("--num_layers", type=int, default=8)
+    parser.add_argument("--heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--max_grad_norm", type=float, default=2.0)
 
@@ -377,6 +423,13 @@ def main() -> None:
         default=0.1,
         help="Initial LR scale during warmup (1.0 keeps the original LR).",
     )
+    parser.add_argument(
+        "--eval_checkpoint",
+        type=str,
+        default="last",
+        choices=["last", "best"],
+        help="Choose which checkpoint to use for ID/OOD evaluation summaries.",
+    )
 
     parser.add_argument("--enable_code", dest="enable_code", action="store_true")
     parser.add_argument("--disable_code", dest="enable_code", action="store_false")
@@ -427,6 +480,10 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.cache_root.mkdir(parents=True, exist_ok=True)
+    checkpoints_dir = args.output_dir / "checkpoints"
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    best_model_path = checkpoints_dir / "model_best.pt"
+    last_model_path = checkpoints_dir / "model_last.pt"
 
     if args.enable_code and args.code_cache_device.startswith("cuda") and not torch.cuda.is_available():
         print("CUDA not available for code caching; falling back to CPU.")
@@ -464,6 +521,9 @@ def main() -> None:
     samples = processor.collect_designs(max_designs=args.max_designs, seed=args.seed)
     if not samples:
         raise RuntimeError("No design samples were parsed. Check dataset path.")
+    samples = _filter_invalid_samples(samples)
+    if not samples:
+        raise RuntimeError("No valid design samples remained after cache filtering.")
 
     code_cache = None
     code_embedding_dim: Optional[int] = None
@@ -508,6 +568,8 @@ def main() -> None:
             "dataset/test_samples": int(indices["test"].numel()),
         })
     target_mean, target_std = compute_label_stats(dataset, indices["train"])
+    target_mean_cpu = target_mean.clone().detach().cpu()
+    target_std_cpu = target_std.clone().detach().cpu()
     train_loader = data_loader_from_subset(dataset, indices["train"], args.batch_size, shuffle=True, num_workers=args.num_workers)
     valid_loader = data_loader_from_subset(dataset, indices["valid"], args.batch_size, shuffle=False, num_workers=args.num_workers)
     test_loader = data_loader_from_subset(dataset, indices["test"], args.batch_size, shuffle=False, num_workers=args.num_workers)
@@ -575,6 +637,8 @@ def main() -> None:
 
     best_state: Optional[Dict[str, torch.Tensor]] = None
     best_val_loss = float("inf")
+    best_epoch: Optional[int] = None
+    last_val_loss: Optional[float] = None
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -677,9 +741,21 @@ def main() -> None:
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            best_epoch = epoch
             print(f"  New best model at epoch {epoch}")
             if use_swanlab:
                 swanlab.log({"best/epoch": epoch, "best/val_loss": best_val_loss, "best/lr": current_lr})
+            best_payload = {
+                "model_state": best_state,
+                "model_type": "multimodal" if args.enable_code else "graph",
+                "target_names": list(TARGET_NAMES),
+                "target_mean": target_mean_cpu.clone(),
+                "target_std": target_std_cpu.clone(),
+                "epoch": epoch,
+                "val_loss": float(best_val_loss),
+                "args": serialized_args,
+            }
+            torch.save(best_payload, best_model_path)
 
         if warmup_scheduler is not None and epoch <= args.lr_warmup_epochs:
             warmup_scheduler.step()
@@ -688,9 +764,36 @@ def main() -> None:
                 main_scheduler.step(val_loss)
             else:
                 main_scheduler.step()
+        last_val_loss = float(val_loss)
 
-    if best_state is not None:
-        model.load_state_dict(best_state)
+    final_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    final_payload = {
+        "model_state": final_state,
+        "model_type": "multimodal" if args.enable_code else "graph",
+        "target_names": list(TARGET_NAMES),
+        "target_mean": target_mean_cpu.clone(),
+        "target_std": target_std_cpu.clone(),
+        "epoch": args.epochs,
+        "val_loss": None if last_val_loss is None else float(last_val_loss),
+        "best_epoch": best_epoch,
+        "best_val_loss": None if best_val_loss == float("inf") else float(best_val_loss),
+        "args": serialized_args,
+    }
+    torch.save(final_payload, last_model_path)
+    print(f"\nSaved final model checkpoint to {last_model_path}")
+    if best_epoch is not None:
+        print(f"Current best checkpoint stored at {best_model_path} (epoch {best_epoch})")
+
+    eval_state = final_state
+    eval_label = "last"
+    if args.eval_checkpoint == "best":
+        if best_state is not None:
+            eval_state = best_state
+            eval_label = "best"
+        else:
+            print("Warning: best checkpoint requested for evaluation but unavailable; using last checkpoint instead.")
+    model.load_state_dict(eval_state)
+    print(f"Loaded {eval_label} checkpoint for evaluation.")
 
     id_test_output = evaluate(
         model,
