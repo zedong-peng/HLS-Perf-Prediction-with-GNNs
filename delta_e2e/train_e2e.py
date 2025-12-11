@@ -39,7 +39,7 @@ import shutil
 import glob
 import swanlab
 import hashlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import signal
 import atexit
 import gc
@@ -131,7 +131,7 @@ class E2EDifferentialProcessor:
         self.rebuild_cache = rebuild_cache
         self.hierarchical = hierarchical  # 是否启用分层区域节点
         self.region = region  # 是否启用 region 信息
-        # 并行线程数（仅 CLI 配置；<=0 或 None 则自动）
+        # 并行线程数（仅 CLI 配置；<=0 或 None 则自动），默认 32 核心
         if isinstance(max_workers, int) and max_workers > 0:
             self.max_workers = int(max_workers)
         else:
@@ -236,35 +236,29 @@ class E2EDifferentialProcessor:
         if not tasks:
             # 无任务
             return pairs
-        
-        def _process_task(task: Tuple[Dict, Path, str, str, str]):
-            kernel_data, design_dir, source_name, algo_name, design_id = task
-            try:
-                # print("start processing design_dir: ", design_dir)
-                design_data = self._collect_design_data(design_dir, source_name, algo_name, design_id)
-                # print("end processing design_dir: ", design_dir)
-                if design_data:
-                    return self._create_pair(kernel_data, design_data)
-                return None
-            except Exception:
-                return None
-        
-        from concurrent.futures import ThreadPoolExecutor as _TPE
-        with _TPE(max_workers=self.max_workers) as executor:
-            # 提交所有任务
-            future_to_task = {executor.submit(_process_task, task): task for task in tasks}
-            
-            # 使用tqdm显示进度，包含成功/失败统计
-            with tqdm(total=len(tasks), desc="生成配对", ncols=100, 
-                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
-                success_count = 0
-                for future in as_completed(future_to_task):
-                    result = future.result()
-                    if result:
-                        pairs.append(result)
-                        success_count += 1
-                    pbar.update(1)
-                    pbar.set_postfix({'成功': success_count, '失败': pbar.n - success_count})
+
+        def _run_with_executor(executor_cls):
+            with executor_cls(max_workers=self.max_workers) as executor:
+                future_to_task = {executor.submit(self._process_task, task): task for task in tasks}
+                
+                # 使用tqdm显示进度，包含成功/失败统计
+                with tqdm(total=len(tasks), desc="生成配对", ncols=100, 
+                         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
+                    success_count = 0
+                    for future in as_completed(future_to_task):
+                        result = future.result()
+                        if result:
+                            pairs.append(result)
+                            success_count += 1
+                        pbar.update(1)
+                        pbar.set_postfix({'成功': success_count, '失败': pbar.n - success_count})
+
+        try:
+            _run_with_executor(ProcessPoolExecutor)
+        except Exception as exc:
+            print(f"进程池并行构建缓存失败，改用线程池: {exc}")
+            pairs.clear()
+            _run_with_executor(ThreadPoolExecutor)
         
         # 缓存配对数据
         if pairs:
@@ -276,6 +270,17 @@ class E2EDifferentialProcessor:
             return pairs
 
         return self._load_cached_pairs(limit=limit, materialize=False)
+
+    def _process_task(self, task: Tuple[Dict, Path, str, str, str]) -> Optional[Dict]:
+        """单个kernel-design配对的处理任务（供并行执行使用）"""
+        kernel_data, design_dir, source_name, algo_name, design_id = task
+        try:
+            design_data = self._collect_design_data(design_dir, source_name, algo_name, design_id)
+            if design_data:
+                return self._create_pair(kernel_data, design_data)
+            return None
+        except Exception:
+            return None
     
     def _collect_kernel_data(self, kernel_path: Path, source_name: str, algo_name: str) -> Optional[Dict]:
         """收集单个kernel的数据"""
@@ -926,8 +931,8 @@ class SimpleDifferentialGNN(nn.Module):
             if self.kernel_baseline == 'learned':
                 self.kernel_head = _make_head(hidden_dim)
             # delta 头融合多种交互项
-            self.delta_input_norm = nn.LayerNorm(hidden_dim * 4)
-            self.delta_head = _make_head(hidden_dim * 4)
+            self.delta_input_norm = nn.LayerNorm(hidden_dim * 2)
+            self.delta_head = _make_head(hidden_dim * 2)
         else:
             # 直接预测头
             self.design_head = _make_head(hidden_dim)
@@ -1005,9 +1010,9 @@ class SimpleDifferentialGNN(nn.Module):
             # 构建 delta 输入：包含 kernel/design 表征及其交互
             delta_input = torch.cat([
                 kernel_repr,
-                design_repr,
-                design_repr - kernel_repr,
-                design_repr * kernel_repr
+                design_repr
+                # design_repr - kernel_repr,
+                # design_repr * kernel_repr
             ], dim=-1)
             delta_input = self.delta_input_norm(delta_input) # add layer norm to delta input, avoid gradient explosion in DSP training.
 
@@ -1440,9 +1445,9 @@ def main():
     parser.add_argument('--region', type=str, default='off', choices=['on', 'off'],
                         help='是否启用 region 信息（构图元数据中记录），on/off')
 
-    # 并行参数
-    parser.add_argument('--max_workers', type=int, default=-1,
-                        help='数据处理并行线程数（仅 CLI；<=0 表示自动）')
+    # 并行构建图cache参数
+    parser.add_argument('--max_workers', type=int, default=32,
+                        help='数据处理并行线程/进程数（默认32；<=0 表示自动选择）')
     
     # 模型保存选项
     parser.add_argument('--save_final_model', action='store_true',
