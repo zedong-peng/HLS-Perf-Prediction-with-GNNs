@@ -38,14 +38,31 @@ import re
 import shutil
 import glob
 import swanlab
+from swanlab.data.modules.custom_charts.echarts import Scatter, options as opts
+from swanlab.data.modules.custom_charts import Echarts
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import signal
 import atexit
 import gc
 import sys
+import multiprocessing as mp
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 _shutdown_requested = False
+
+
+def log_status(message: str, swan_key: str = "status/message", step: Optional[int] = None):
+    """Print a status message and mirror it to SwanLab (as text; optional numeric step)."""
+    print(message, flush=True)
+    try:
+        payload = {swan_key: swanlab.Text(message)}
+        if step is not None:
+            payload["status/step"] = float(step)
+        swanlab.log(payload)
+    except Exception:
+        pass
 
 def _graceful_cleanup():
     try:
@@ -88,8 +105,6 @@ except ModuleNotFoundError:
         get_node_feature_dims, get_edge_feature_dims
     )
 
-# 归一化因子已移除，直接使用原始值
-
 # 可用资源数量（用于计算ulti-RMSE）
 AVAILABLE_RESOURCES = { 
     'dsp': 9024,
@@ -124,14 +139,27 @@ class E2EDifferentialProcessor:
     """端到端差值数据处理器"""
     
     def __init__(self, kernel_base_dir: str, design_base_dir: str, output_dir: str,
-                 cache_root: str = "./graph_cache", rebuild_cache: bool = False, hierarchical: bool = False, region: bool = False, max_workers: Optional[int] = None):
+                 cache_root: str = "./graph_cache", rebuild_cache: bool = False, hierarchical: bool = False, region: bool = False, max_workers: Optional[int] = None,
+                 use_code_feature: bool = False, code_model_path: Optional[str] = None, code_cache_root: Optional[str] = None,
+                 code_pooling: str = "last_token", code_max_length: int = 2048, code_normalize: bool = True, code_batch_size: int = 8):
         self.kernel_base_dir = kernel_base_dir
         self.design_base_dir = design_base_dir
         self.output_dir = output_dir
         self.rebuild_cache = rebuild_cache
         self.hierarchical = hierarchical  # 是否启用分层区域节点
         self.region = region  # 是否启用 region 信息
-        # 并行线程数（仅 CLI 配置；<=0 或 None 则自动），默认 32 核心
+        self.use_code_feature = bool(use_code_feature)
+        self.code_model_path = code_model_path
+        self.code_pooling = code_pooling
+        self.code_max_length = code_max_length
+        self.code_normalize = bool(code_normalize)
+        self.code_batch_size = max(1, int(code_batch_size) if code_batch_size is not None else 8)
+        self.code_cache_root = code_cache_root or cache_root
+        self.code_cache_dir = os.path.join(self.code_cache_root, "code_embeddings")
+        os.makedirs(self.code_cache_dir, exist_ok=True)
+        self._code_embedder = None
+        
+        # 并行线程数（仅 CLI 配置；<=0 或 None 则自动）
         if isinstance(max_workers, int) and max_workers > 0:
             self.max_workers = int(max_workers)
         else:
@@ -144,7 +172,10 @@ class E2EDifferentialProcessor:
         db = os.path.abspath(self.design_base_dir)
         # 在cache key中加入特征版本，避免特征维度变化导致旧缓存失配
         feature_version = "featv=20250924.0"
-        cache_key_src = f"kb={kb}|db={db}|hier={'1' if self.hierarchical else '0'}|region={'1' if self.region else '0'}|{feature_version}"
+        code_tag = ""
+        if self.use_code_feature:
+            code_tag = f"|code=1|pool={self.code_pooling}|mlen={self.code_max_length}|norm={'1' if self.code_normalize else '0'}|model={self.code_model_path or 'none'}"
+        cache_key_src = f"kb={kb}|db={db}|hier={'1' if self.hierarchical else '0'}|region={'1' if self.region else '0'}|{feature_version}{code_tag}"
         cache_key = hashlib.md5(cache_key_src.encode("utf-8")).hexdigest()[:12]
         self.graph_cache_dir = os.path.join(cache_root, cache_key)
         os.makedirs(self.graph_cache_dir, exist_ok=True)
@@ -163,29 +194,195 @@ class E2EDifferentialProcessor:
                         "hierarchical": self.hierarchical,
                         "region": self.region,
                         "feature_version": feature_version,
-                        "max_workers": int(self.max_workers)
+                        "max_workers": int(self.max_workers),
+                        "use_code_feature": self.use_code_feature,
+                        "code_model_path": self.code_model_path,
+                        "code_pooling": self.code_pooling,
+                        "code_max_length": int(self.code_max_length),
+                        "code_normalize": self.code_normalize,
+                        "code_batch_size": int(self.code_batch_size),
+                        "code_cache_dir": self.code_cache_dir
                     }, mf, indent=2)
         except Exception:
             pass
         
         # 静默初始化，减少console输出
         pass
+
+    def _get_code_embedder(self):
+        """懒加载代码嵌入模型，仅在启用 code 特征时使用。"""
+        if self._code_embedder is not None:
+            return self._code_embedder
+        if not self.code_model_path:
+            raise ValueError("use_code_feature=True 时必须提供 --code_model_path")
+        try:
+            from LLM_embedding import LLMEmbedder
+        except Exception as exc:
+            raise ImportError(f"无法导入 LLMEmbedder，请检查 LLM_embedding.py 是否可用: {exc}")
+        self._code_embedder = LLMEmbedder(
+            self.code_model_path,
+            pooling=self.code_pooling,
+            max_length=int(self.code_max_length),
+            normalize=self.code_normalize
+        )
+        return self._code_embedder
+
+    def _read_design_code(self, design_path: Path) -> Tuple[Optional[str], Optional[str]]:
+        """读取 design 目录中的 .c/.cpp 源码并返回拼接字符串及哈希。"""
+        code_files = sorted(
+            [p for p in design_path.rglob("*") if p.suffix in (".c", ".cpp")],
+            key=lambda p: p.name
+        )
+        if not code_files:
+            return None, None
+        contents: List[str] = []
+        for code_file in code_files:
+            try:
+                with open(code_file, 'r', encoding='utf-8', errors='ignore') as cf:
+                    contents.append(cf.read())
+            except Exception:
+                continue
+        if not contents:
+            return None, None
+        code_text = "\n\n".join(contents)
+        code_hash = hashlib.md5(code_text.encode("utf-8")).hexdigest()
+        return code_text, code_hash
+
+    def _code_cache_path(self, design_path: Path, code_hash: str) -> str:
+        """生成代码嵌入缓存路径。"""
+        cache_key_src = f"path={design_path}|hash={code_hash}|model={self.code_model_path}|pool={self.code_pooling}|mlen={self.code_max_length}|norm={'1' if self.code_normalize else '0'}"
+        cache_key = hashlib.md5(cache_key_src.encode("utf-8")).hexdigest()
+        return os.path.join(self.code_cache_dir, f"{cache_key}.pt")
+
+    def _load_cached_code_embedding(self, cache_path: str) -> Optional[Tuple[torch.Tensor, str]]:
+        try:
+            cached = torch.load(cache_path, map_location='cpu')
+            emb = cached.get('embedding')
+            meta = cached.get('meta', {})
+            code_hash = meta.get('code_hash')
+            if emb is not None:
+                return emb, code_hash
+        except Exception:
+            return None
+        return None
+
+    def _store_code_embeddings(self, batch_entries: List[Tuple[Path, str, str]]):
+        """对一批 code 文本做嵌入并写入缓存。"""
+        if not batch_entries:
+            return
+        embedder = self._get_code_embedder()
+        texts = [entry[1] for entry in batch_entries]
+        with torch.inference_mode():
+            embeddings = embedder.encode(texts)
+        for emb, (design_path, _, code_hash) in zip(embeddings, batch_entries):
+            cache_path = self._code_cache_path(design_path, code_hash)
+            meta = {
+                "design_path": str(design_path),
+                "code_hash": code_hash,
+                "model_path": self.code_model_path,
+                "pooling": self.code_pooling,
+                "max_length": int(self.code_max_length),
+                "normalize": self.code_normalize
+            }
+            try:
+                torch.save({
+                    "embedding": emb.detach().cpu(),
+                    "meta": meta
+                }, cache_path)
+            except Exception as exc:
+                print(f"保存代码嵌入失败 {design_path}: {exc}")
+
+    def _precompute_design_code_embeddings(self, design_paths: List[Path]):
+        """预先对未缓存的 design 源码做批量嵌入，避免训练时反复加载模型。"""
+        if not self.use_code_feature:
+            return
+        unique_paths: List[Path] = []
+        seen: set[str] = set()
+        for p in design_paths:
+            key = str(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_paths.append(p)
+
+        to_encode: List[Tuple[Path, str, str]] = []
+        for dpath in unique_paths:
+            code_text, code_hash = self._read_design_code(dpath)
+            if not code_text or not code_hash:
+                continue
+            cache_path = self._code_cache_path(dpath, code_hash)
+            if os.path.exists(cache_path):
+                continue
+            to_encode.append((dpath, code_text, code_hash))
+
+        if not to_encode:
+            return
+
+        log_status(f"[Step3.3] 预编码 design 源码嵌入: {len(to_encode)} 个样本（batch={self.code_batch_size}）")
+        with tqdm(
+            total=len(to_encode),
+            desc="预编码设计源码",
+            ncols=100,
+            unit="design"
+        ) as pbar:
+            for i in range(0, len(to_encode), self.code_batch_size):
+                batch_entries = to_encode[i:i + self.code_batch_size]
+                self._store_code_embeddings(batch_entries)
+                pbar.update(len(batch_entries))
+        log_status(f"[Step3.3] 设计源码嵌入预编码完成，写入 {len(to_encode)} 个缓存")
+
+    def _get_design_code_embedding(self, design_path: Path) -> Tuple[Optional[torch.Tensor], Optional[str]]:
+        """获取单个 design 的代码嵌入（优先使用缓存）。"""
+        if not self.use_code_feature:
+            return None, None
+        code_text, code_hash = self._read_design_code(design_path)
+        if not code_text or not code_hash:
+            return None, None
+        cache_path = self._code_cache_path(design_path, code_hash)
+        cached = self._load_cached_code_embedding(cache_path)
+        if cached is not None:
+            emb, _ = cached
+            return emb, code_hash
+        # 缓存不存在则即时编码并写入缓存
+        try:
+            embedder = self._get_code_embedder()
+            with torch.inference_mode():
+                emb = embedder.encode([code_text])[0]
+            meta = {
+                "design_path": str(design_path),
+                "code_hash": code_hash,
+                "model_path": self.code_model_path,
+                "pooling": self.code_pooling,
+                "max_length": int(self.code_max_length),
+                "normalize": self.code_normalize
+            }
+            torch.save({
+                "embedding": emb.detach().cpu(),
+                "meta": meta
+            }, cache_path)
+            return emb.detach().cpu(), code_hash
+        except Exception as exc:
+            print(f"编码 design 代码失败 {design_path}: {exc}")
+            return None, None
     
     def collect_all_data(self, limit: Optional[int] = None, materialize: bool = True) -> List[Dict]:
         """收集所有kernel-design配对数据（全局任务并发）"""
         # 检查是否存在缓存的配对数据
         if (not self.rebuild_cache) and os.path.exists(self.index_path):
+            log_status(f"[Step3] 检测到缓存索引，直接加载配对数据: {self.index_path}")
             return self._load_cached_pairs(limit=limit, materialize=materialize)
 
         cache_file = os.path.join(self.graph_cache_dir, "paired_graphs.json")
         if (not self.rebuild_cache) and os.path.exists(cache_file):
             # 兼容旧格式：加载一次后转换为流式缓存
+            log_status(f"[Step3] 检测到旧版缓存 {cache_file}，开始转换为新格式索引...")
             cached = self._load_cached_pairs_from_legacy(cache_file)
             self._save_cached_pairs(cached)
             try:
                 os.remove(cache_file)
             except Exception:
                 pass
+            log_status("[Step3] 旧版缓存转换完成，重新加载新索引")
             return self._load_cached_pairs(limit=limit, materialize=materialize)
 
         pairs: List[Dict] = []
@@ -203,6 +400,7 @@ class E2EDifferentialProcessor:
         # 先扫描，构建 (kernel_data, design_dir, source_name, algo_name, design_id) 全局任务列表
         tasks: List[Tuple[Dict, Path, str, str, str]] = []
         
+        log_status(f"[Step3.1] 开始扫描设计目录，准备构建图缓存: {design_base}")
         for source_dir in tqdm(list(design_base.iterdir()), desc="扫描数据源"):
             if not source_dir.is_dir():
                 continue
@@ -236,9 +434,24 @@ class E2EDifferentialProcessor:
         if not tasks:
             # 无任务
             return pairs
+        log_status(f"[Step3.1] 扫描完成，发现 {len(tasks)} 个kernel-design任务，开始构建图缓存与配对")
+        
+        # 预先编码设计源码，避免在并行过程中重复加载模型
+        if self.use_code_feature:
+            design_paths_for_code = [t[1] for t in tasks]
+            log_status(f"[Step3.2] 开始预编码设计源码嵌入，共 {len(design_paths_for_code)} 个 design")
+            self._precompute_design_code_embeddings(design_paths_for_code)
 
         def _run_with_executor(executor_cls):
-            with executor_cls(max_workers=self.max_workers) as executor:
+            log_status(f"[Step3.4] 并行处理 {len(tasks)} 个任务构建缓存，max_workers={self.max_workers}")
+            extra_kwargs = {}
+            # 当系统有 CUDA 或已加载大模型时，使用 spawn 上下文避免 fork 后 CUDA 复用报错
+            if executor_cls is ProcessPoolExecutor:
+                try:
+                    extra_kwargs["mp_context"] = mp.get_context("spawn")
+                except Exception:
+                    pass
+            with executor_cls(max_workers=self.max_workers, **extra_kwargs) as executor:
                 future_to_task = {executor.submit(self._process_task, task): task for task in tasks}
                 
                 # 使用tqdm显示进度，包含成功/失败统计
@@ -263,6 +476,7 @@ class E2EDifferentialProcessor:
         # 缓存配对数据
         if pairs:
             self._save_cached_pairs(pairs)
+            log_status(f"[Step3.5] 图缓存与配对完成，共生成 {len(pairs)} 条记录，已写入缓存目录 {self.graph_cache_dir}")
 
         if materialize:
             if limit is not None and len(pairs) > limit:
@@ -343,6 +557,11 @@ class E2EDifferentialProcessor:
             
             # 提取pragma信息
             pragma_info = self._extract_pragma_info(design_path)
+
+            design_code_embedding = None
+            code_hash = None
+            if self.use_code_feature:
+                design_code_embedding, code_hash = self._get_design_code_embedding(design_path)
             
             return {
                 'type': 'design',
@@ -352,7 +571,9 @@ class E2EDifferentialProcessor:
                 'base_path': str(design_path),
                 'performance': perf_data,
                 'graph': graph_data,
-                'pragma_info': pragma_info
+                'pragma_info': pragma_info,
+                'design_code_embedding': design_code_embedding,
+                'code_hash': code_hash
             }
             
         except Exception as e:
@@ -633,6 +854,8 @@ class E2EDifferentialProcessor:
                 'design_graph': design_graph,
                 'performance_delta': performance_delta,
                 'pragma_info': design_data['pragma_info'],
+                'design_code_embedding': design_data.get('design_code_embedding'),
+                'code_hash': design_data.get('code_hash'),
                 'kernel_info': kernel_data,
                 'design_info': design_data
             }
@@ -656,6 +879,12 @@ class E2EDifferentialProcessor:
                 # 确保图数据在 CPU 上存储
                 kernel_graph = pair['kernel_graph'].to('cpu')
                 design_graph = pair['design_graph'].to('cpu')
+                design_code_embedding = None
+                if pair.get('design_code_embedding') is not None:
+                    try:
+                        design_code_embedding = pair['design_code_embedding'].detach().cpu()
+                    except Exception:
+                        design_code_embedding = pair['design_code_embedding']
 
                 payload = {
                     'pair_id': pair['pair_id'],
@@ -663,8 +892,10 @@ class E2EDifferentialProcessor:
                     'design_graph': design_graph,
                     'performance_delta': pair['performance_delta'],
                     'pragma_info': pair['pragma_info'],
+                    'design_code_embedding': design_code_embedding,
+                    'code_hash': pair.get('code_hash'),
                     'kernel_info': {k: v for k, v in pair['kernel_info'].items() if k != 'graph'},
-                    'design_info': {k: v for k, v in pair['design_info'].items() if k != 'graph'}
+                    'design_info': {k: v for k, v in pair['design_info'].items() if k not in ('graph', 'design_code_embedding')}
                 }
                 is_valid = self._is_pair_payload_valid(payload)
 
@@ -679,6 +910,8 @@ class E2EDifferentialProcessor:
                     'pragma_count': int(payload['pragma_info'].get('pragma_count', 0)),
                     'design_num_nodes': int(design_graph.num_nodes),
                     'kernel_num_nodes': int(kernel_graph.num_nodes),
+                    'has_code': bool(design_code_embedding is not None),
+                    'code_hash': payload.get('code_hash'),
                     'is_valid': bool(is_valid)
                 }
                 index_f.write(json.dumps(meta, ensure_ascii=False) + "\n")
@@ -699,7 +932,7 @@ class E2EDifferentialProcessor:
                 value = float(raw_value)
             except (TypeError, ValueError):
                 continue
-            if value > AVAILABLE_RESOURCES[normalized_key]:
+            if value > 0.1 * AVAILABLE_RESOURCES[normalized_key]:
                 return False
         return True
 
@@ -816,6 +1049,8 @@ class E2EDifferentialProcessor:
                     'design_graph': design_graph,
                     'performance_delta': cached_pair['performance_delta'],
                     'pragma_info': cached_pair['pragma_info'],
+                    'design_code_embedding': cached_pair.get('design_code_embedding'),
+                    'code_hash': cached_pair.get('code_hash'),
                     'kernel_info': cached_pair['kernel_info'],
                     'design_info': cached_pair['design_info']
                 }
@@ -841,7 +1076,8 @@ class SimpleDifferentialGNN(nn.Module):
     def __init__(self, node_dim: int, hidden_dim: int = 128, num_layers: int = 3, 
                  dropout: float = 0.1, target_metric: str = 'dsp', differential: bool = True,
                  gnn_type: str = 'gcn', kernel_baseline: str = 'learned',
-                 pna_deg: Optional[torch.Tensor] = None, edge_dim: Optional[int] = None):
+                 pna_deg: Optional[torch.Tensor] = None, edge_dim: Optional[int] = None,
+                 use_code_feature: bool = False, code_dim: Optional[int] = None):
         super().__init__()
         self.target_metric = target_metric
         self.hidden_dim = hidden_dim
@@ -849,6 +1085,10 @@ class SimpleDifferentialGNN(nn.Module):
         self.gnn_type = gnn_type.lower()
         self.kernel_baseline = kernel_baseline.lower()
         self.edge_dim = max(0, edge_dim or 0)
+        self.use_code_feature = bool(use_code_feature)
+        self.code_dim = code_dim
+        if self.use_code_feature and (self.code_dim is None or self.code_dim <= 0):
+            raise ValueError("use_code_feature=True 需要提供有效的 code_dim")
 
         # 节点编码器
         self.node_encoder = nn.Linear(node_dim, hidden_dim)
@@ -914,6 +1154,14 @@ class SimpleDifferentialGNN(nn.Module):
             from torch_geometric.nn import LayerNorm
             self.batch_norms.append(LayerNorm(hidden_dim))
         
+        # 代码模态投影
+        self.code_proj: Optional[nn.Module] = None
+        if self.use_code_feature:
+            self.code_proj = nn.Sequential(
+                nn.LayerNorm(self.code_dim),
+                nn.Linear(self.code_dim, hidden_dim)
+            )
+        
         def _make_head(input_dim: int) -> nn.Sequential:
             return nn.Sequential(
                 nn.Linear(input_dim, hidden_dim),
@@ -931,11 +1179,15 @@ class SimpleDifferentialGNN(nn.Module):
             if self.kernel_baseline == 'learned':
                 self.kernel_head = _make_head(hidden_dim)
             # delta 头融合多种交互项
-            self.delta_input_norm = nn.LayerNorm(hidden_dim * 2)
-            self.delta_head = _make_head(hidden_dim * 2)
+            delta_input_dim = hidden_dim * 2
+            if self.use_code_feature:
+                delta_input_dim += hidden_dim  # 设计代码模态
+            self.delta_input_norm = nn.LayerNorm(delta_input_dim)
+            self.delta_head = _make_head(delta_input_dim)
         else:
             # 直接预测头
-            self.design_head = _make_head(hidden_dim)
+            design_input_dim = hidden_dim + (hidden_dim if self.use_code_feature else 0)
+            self.design_head = _make_head(design_input_dim)
 
         # 指标索引映射
         self.metric_idx = {'dsp': 0, 'lut': 1, 'ff': 2, 'latency': 3}[target_metric]
@@ -992,10 +1244,15 @@ class SimpleDifferentialGNN(nn.Module):
         # 改为 sum 池化以更贴近资源求和语义
         return global_add_pool(x, batch)
     
-    def forward(self, kernel_graph, design_graph, pragma_count):
+    def forward(self, kernel_graph, design_graph, pragma_count, design_code: Optional[torch.Tensor] = None):
         """前向传播 - 支持差分和直接预测两种模式"""
         # 编码图
         design_repr = self.encode_graph(design_graph)
+        code_repr = None
+        if self.use_code_feature:
+            if design_code is None:
+                raise ValueError("use_code_feature=True 时需要提供 design_code")
+            code_repr = self.code_proj(design_code.float()) if self.code_proj is not None else design_code.float()
 
         if self.differential:
             # 差分模式：先预测 kernel，再预测 delta
@@ -1008,12 +1265,10 @@ class SimpleDifferentialGNN(nn.Module):
                 kernel_pred = kernel_graph.y[:, self.metric_idx].unsqueeze(-1).to(kernel_repr.device)
 
             # 构建 delta 输入：包含 kernel/design 表征及其交互
-            delta_input = torch.cat([
-                kernel_repr,
-                design_repr
-                # design_repr - kernel_repr,
-                # design_repr * kernel_repr
-            ], dim=-1)
+            delta_parts = [kernel_repr, design_repr]
+            if code_repr is not None:
+                delta_parts.append(code_repr)
+            delta_input = torch.cat(delta_parts, dim=-1)
             delta_input = self.delta_input_norm(delta_input) # add layer norm to delta input, avoid gradient explosion in DSP training.
 
             delta_pred = self.delta_head(delta_input)
@@ -1027,7 +1282,11 @@ class SimpleDifferentialGNN(nn.Module):
             }
         else:
             # 直接预测模式：只使用design
-            prediction = self.design_head(design_repr)
+            design_parts = [design_repr]
+            if code_repr is not None:
+                design_parts.append(code_repr)
+            design_input = torch.cat(design_parts, dim=-1)
+            prediction = self.design_head(design_input)
             return {'direct_pred': prediction}
 
 
@@ -1070,6 +1329,7 @@ class E2EDifferentialDataset(torch.utils.data.Dataset):
             'design_perf': design_perf,
             'performance_delta': perf_delta,
             'pragma_count': pragma_count,
+            'design_code': pair.get('design_code_embedding'),
             'pair_id': pair['pair_id']
         }
 
@@ -1078,6 +1338,7 @@ def differential_collate_fn(batch):
     """自定义批处理函数"""
     kernel_graphs = [item['kernel_graph'] for item in batch]
     design_graphs = [item['design_graph'] for item in batch]
+    design_codes = [item.get('design_code') for item in batch]
     
     kernel_perfs = torch.cat([item['kernel_perf'] for item in batch], dim=0)
     design_perfs = torch.cat([item['design_perf'] for item in batch], dim=0)
@@ -1087,6 +1348,20 @@ def differential_collate_fn(batch):
     # 使用PyG的Batch直接拼接，避免在collate中再启动DataLoader
     kernel_batch = Batch.from_data_list(kernel_graphs)
     design_batch = Batch.from_data_list(design_graphs)
+
+    design_code_batch = None
+    if any(dc is not None for dc in design_codes):
+        first_dc = next((dc for dc in design_codes if dc is not None), None)
+        if first_dc is not None:
+            first_tensor = first_dc if isinstance(first_dc, torch.Tensor) else torch.tensor(first_dc)
+            code_dim = first_tensor.shape[-1]
+            code_tensors: List[torch.Tensor] = []
+            for dc in design_codes:
+                if dc is None:
+                    code_tensors.append(torch.zeros(code_dim, dtype=first_tensor.dtype))
+                else:
+                    code_tensors.append(dc if isinstance(dc, torch.Tensor) else torch.tensor(dc))
+            design_code_batch = torch.stack(code_tensors, dim=0)
     
     return {
         'kernel_graph': kernel_batch,
@@ -1094,7 +1369,8 @@ def differential_collate_fn(batch):
         'kernel_perf': kernel_perfs,
         'design_perf': design_perfs,
         'performance_delta': perf_deltas,
-        'pragma_count': pragma_counts
+        'pragma_count': pragma_counts,
+        'design_code': design_code_batch
     }
 
 
@@ -1102,7 +1378,8 @@ def differential_collate_fn(batch):
 # Training Functions
 # ============================================================================
 
-def train_epoch(model, device, train_loader, optimizer, loss_fn=None, grad_accum_steps=1, max_grad_norm=1.0):
+def train_epoch(model, device, train_loader, optimizer, loss_fn=None, grad_accum_steps=1,
+               max_grad_norm=1.0, use_tqdm: bool = False, progress_desc: Optional[str] = None):
     """训练一个epoch"""
     model.train()
     loss_fn = loss_fn or F.l1_loss
@@ -1111,14 +1388,21 @@ def train_epoch(model, device, train_loader, optimizer, loss_fn=None, grad_accum
     
     optimizer.zero_grad(set_to_none=True)
     
-    for step_idx, batch in enumerate(train_loader):
+    iterator = train_loader
+    if use_tqdm:
+        iterator = tqdm(train_loader, desc=progress_desc or "Train", ncols=100)
+
+    for step_idx, batch in enumerate(iterator):
         # 移动到设备
         kernel_graph = batch['kernel_graph'].to(device, non_blocking=True)
         design_graph = batch['design_graph'].to(device, non_blocking=True)
         pragma_count = batch['pragma_count'].to(device, non_blocking=True)
+        design_code = batch.get('design_code')
+        if design_code is not None:
+            design_code = design_code.to(device, non_blocking=True)
         
         # 前向传播
-        predictions = model(kernel_graph, design_graph, pragma_count)
+        predictions = model(kernel_graph, design_graph, pragma_count, design_code)
         
         # 计算损失
         targets = {
@@ -1187,9 +1471,12 @@ def evaluate_model(model, data_loader, device, target_metric='dsp', return_predi
             kernel_graph = batch['kernel_graph'].to(device, non_blocking=True)
             design_graph = batch['design_graph'].to(device, non_blocking=True)
             pragma_count = batch['pragma_count'].to(device, non_blocking=True)
+            design_code = batch.get('design_code')
+            if design_code is not None:
+                design_code = design_code.to(device, non_blocking=True)
 
             # 前向传播
-            predictions = model(kernel_graph, design_graph, pragma_count)
+            predictions = model(kernel_graph, design_graph, pragma_count, design_code)
 
             # 准备目标值
             targets = {
@@ -1335,28 +1622,42 @@ def evaluate_model(model, data_loader, device, target_metric='dsp', return_predi
 
 
 def _create_prediction_plots(test_metrics: Dict, target_metric: str, output_dir: str):
-    """创建设计指标预测vs真实值散点图"""
-    design_true = test_metrics['design_true'].cpu().numpy()
-    design_preds = test_metrics['design_preds'].cpu().numpy()
+    """将设计指标预测散点直接作为 ECharts 数据上传到 SwanLab。"""
+    design_true = test_metrics['design_true'].cpu().numpy().tolist()
+    design_preds = test_metrics['design_preds'].cpu().numpy().tolist()
 
-    # 设计指标预测散点图
-    plt.figure(figsize=(8, 6))
-    plt.scatter(design_true, design_preds, alpha=0.6, s=50)
-    min_val = min(design_true.min(), design_preds.min())
-    max_val = max(design_true.max(), design_preds.max())
-    plt.plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8, linewidth=2, label='Perfect Prediction')
-    plt.xlabel(f'True {target_metric.upper()} (Real Resource Units)')
-    plt.ylabel(f'Predicted {target_metric.upper()} (Real Resource Units)')
-    plt.title(f'Design Performance Prediction ({target_metric.upper()}) - Real Resource Scale')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
+    min_val = min(min(design_true), min(design_preds))
+    max_val = max(max(design_true), max(design_preds))
 
-    scatter_path = os.path.join(output_dir, f'prediction_scatter_{target_metric}.png')
-    plt.savefig(scatter_path, dpi=300, bbox_inches='tight')
-    plt.close()
+    chart = (
+        Scatter()
+        .add_xaxis(design_true)
+        .add_yaxis(
+            series_name="Pred vs True",
+            y_axis=design_preds,
+            symbol_size=6,
+            label_opts=opts.LabelOpts(is_show=False),
+        )
+        .set_global_opts(
+            title_opts=opts.TitleOpts(title=f"Prediction Scatter ({target_metric.upper()})"),
+            xaxis_opts=opts.AxisOpts(
+                name=f"True {target_metric.upper()}",
+                min_=min_val,
+                max_=max_val,
+                type_="value",
+            ),
+            yaxis_opts=opts.AxisOpts(
+                name=f"Pred {target_metric.upper()}",
+                min_=min_val,
+                max_=max_val,
+                type_="value",
+            ),
+            tooltip_opts=opts.TooltipOpts(trigger="item"),
+        )
+    )
 
-    # 上传到SwanLab
-    swanlab.log({"prediction_scatter": swanlab.Image(scatter_path)})
+    # 直接上传散点数据（前端可交互）
+    swanlab.log({"prediction_scatter": Echarts(chart)})
 
 
 # =========================================================================
@@ -1425,6 +1726,13 @@ def main():
     # 缓存参数
     parser.add_argument('--cache_root', type=str, default=default_cache_root, help='图数据缓存根目录')
     parser.add_argument('--rebuild_cache', action='store_true', help='忽略已有缓存并重新构建')
+    parser.add_argument('--use_code_feature', type=str, default='false', choices=['true', 'false'], help='是否启用设计源码的 LLM 嵌入特征')
+    parser.add_argument('--code_model_path', type=str, default=None, help='LLM 模型路径（启用代码特征时必填）')
+    parser.add_argument('--code_cache_root', type=str, default=default_cache_root, help='代码嵌入缓存根目录')
+    parser.add_argument('--code_pooling', type=str, default='last_token', choices=['last_token', 'mean'], help='代码嵌入的 pooling 策略')
+    parser.add_argument('--code_max_length', type=int, default=1024, help='代码嵌入的最大 token 长度')
+    parser.add_argument('--code_normalize', type=str, default='true', choices=['true', 'false'], help='是否对代码嵌入做 L2 归一化')
+    parser.add_argument('--code_batch_size', type=int, default=8, help='预编码代码嵌入的批大小')
     
     # 调试参数
     parser.add_argument('--max_pairs', type=int, default=None, help='最大配对数量（调试用）')
@@ -1446,8 +1754,8 @@ def main():
                         help='是否启用 region 信息（构图元数据中记录），on/off')
 
     # 并行构建图cache参数
-    parser.add_argument('--max_workers', type=int, default=32,
-                        help='数据处理并行线程/进程数（默认32；<=0 表示自动选择）')
+    parser.add_argument('--max_workers', type=int, default=24,
+                        help='数据处理并行线程/进程数（默认24；<=0 表示自动选择）')
     
     # 模型保存选项
     parser.add_argument('--save_final_model', action='store_true',
@@ -1456,6 +1764,10 @@ def main():
     args = parser.parse_args()
     args.loss_type = args.loss_type.lower()
     loss_fn = resolve_loss_function(args.loss_type)
+    use_code_feature = (args.use_code_feature.lower() == 'true')
+    code_normalize = (args.code_normalize.lower() == 'true')
+    if use_code_feature and not args.code_model_path:
+        raise ValueError("use_code_feature=true 时必须提供 --code_model_path")
     
     # 设置设备
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
@@ -1464,6 +1776,7 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join(args.output_dir, f"e2e_delta_{args.target_metric}_{timestamp}")
     os.makedirs(output_dir, exist_ok=True)
+    log_status(f"[Step1] 输出目录已创建: {output_dir}")
     
     # 初始化SwanLab
     swanlab.init(
@@ -1472,6 +1785,7 @@ def main():
         config=vars(args),
         logdir=output_dir
     )
+    log_status("[Step2] SwanLab 初始化完成，开始数据处理流水线")
     
     # ==================== 数据处理 ====================
     
@@ -1483,11 +1797,20 @@ def main():
         rebuild_cache=args.rebuild_cache,
         hierarchical=(args.hierarchical.lower() == 'on'),
         region=(args.region.lower() == 'on'),
-        max_workers=(None if args.max_workers is None or args.max_workers <= 0 else args.max_workers)
+        max_workers=(None if args.max_workers is None or args.max_workers <= 0 else args.max_workers),
+        use_code_feature=use_code_feature,
+        code_model_path=args.code_model_path,
+        code_cache_root=args.code_cache_root,
+        code_pooling=args.code_pooling,
+        code_max_length=args.code_max_length,
+        code_normalize=code_normalize,
+        code_batch_size=args.code_batch_size
     )
     
     # 收集配对数据
+    log_status("[Step3] 开始构建/加载ID图缓存并生成kernel-design配对")
     pairs = processor.collect_all_data()
+    log_status(f"[Step3.5] ID 图缓存与配对完成，获得 {len(pairs)} 条记录")
     
     if not pairs:
         print("错误: 未找到有效的kernel-design配对")
@@ -1505,11 +1828,21 @@ def main():
             rebuild_cache=args.rebuild_cache,
             hierarchical=(args.hierarchical.lower() == 'on'),
             region=(args.region.lower() == 'on'),
-            max_workers=(None if args.max_workers is None or args.max_workers <= 0 else args.max_workers)
+            max_workers=(None if args.max_workers is None or args.max_workers <= 0 else args.max_workers),
+            use_code_feature=use_code_feature,
+            code_model_path=args.code_model_path,
+            code_cache_root=args.code_cache_root,
+            code_pooling=args.code_pooling,
+            code_max_length=args.code_max_length,
+            code_normalize=code_normalize,
+            code_batch_size=args.code_batch_size
         )
+        log_status("[Step4] 开始构建/加载OOD图缓存并生成kernel-design配对")
         ood_pairs = ood_processor.collect_all_data()
+        log_status(f"[Step4] OOD 图缓存与配对完成，获得 {len(ood_pairs)} 条记录")
     else:
         print(f"提示: OOD 路径不可用或未提供，将跳过 OOD 评估: {args.ood_design_base_dir}")
+        log_status("[Step4] 未提供 OOD 路径，跳过 OOD 评估阶段")
     
     # 记录数据集信息
     swanlab.log({"dataset/total_pairs": len(pairs)})
@@ -1522,7 +1855,7 @@ def main():
     swanlab.log({
         "config/kernel_baseline_mode": 0 if args.kernel_baseline.lower() == 'learned' else 1
     })
-    swanlab.log({"config/loss_type": args.loss_type})
+    swanlab.log({"config/loss_type": swanlab.Text(args.loss_type)})
     # 记录流水线旁证的总体占比（设计图）
     try:
         has_pipe_count = sum(int(getattr(p['design_graph'], 'has_pipeline', 0)) for p in pairs)
@@ -1536,6 +1869,7 @@ def main():
     if args.max_pairs and len(pairs) > args.max_pairs:
         pairs = pairs[:args.max_pairs]
         swanlab.log({"dataset/limited_pairs": args.max_pairs})
+        log_status(f"[Step3.6] 调试模式：截断配对数至 {args.max_pairs}")
     
     # 保存配对信息
     pairs_info = []
@@ -1573,6 +1907,7 @@ def main():
     ood_dataset = E2EDifferentialDataset(ood_pairs, args.target_metric) if ood_pairs else None
     
     # 数据集划分 - 8:1:1随机划分
+    log_status("[Step5] 开始构建数据集并执行 8:1:1 划分")
     total_size = len(dataset)
     train_size = int(0.8 * total_size)
     valid_size = int(0.1 * total_size)
@@ -1587,6 +1922,7 @@ def main():
     valid_dataset = torch.utils.data.Subset(dataset, valid_indices)
     test_dataset = torch.utils.data.Subset(dataset, test_indices)
     ood_test_dataset = ood_dataset  if ood_dataset is not None else None
+    log_status(f"[Step5] 数据集划分完成: train={len(train_dataset)}, valid={len(valid_dataset)}, test={len(test_dataset)}")
     
     # 记录数据划分信息
     swanlab.log({
@@ -1633,12 +1969,20 @@ def main():
             ood_test_dataset, batch_size=args.batch_size, shuffle=False,
             **loader_common_kwargs
         )
+    log_status("[Step6] DataLoader 构建完成，准备创建模型")
     
     # ==================== 创建模型 ====================
     
     # 获取特征维度
     sample_pair = dataset[0]
     node_dim = sample_pair['kernel_graph'].x.size(1)
+    code_dim = None
+    if args.use_code_feature.lower() == 'true':
+        sample_code = sample_pair.get('design_code')
+        if sample_code is not None:
+            code_dim = sample_code.shape[-1]
+        else:
+            raise ValueError("use_code_feature=True 但样本缺少 design_code，请检查源码或缓存构建。")
     edge_dim = 0
     if sample_pair['kernel_graph'].edge_attr is not None:
         edge_dim = sample_pair['kernel_graph'].edge_attr.size(1)
@@ -1689,8 +2033,11 @@ def main():
         gnn_type=args.gnn_type,
         kernel_baseline=args.kernel_baseline if differential_mode else 'learned',
         pna_deg=pna_deg,
-        edge_dim=edge_dim
+        edge_dim=edge_dim,
+        use_code_feature=(args.use_code_feature.lower() == 'true'),
+        code_dim=code_dim
     ).to(device)
+    log_status("[Step7] 模型初始化完成，开始训练循环准备")
     
     # 优化器和调度器
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -1715,6 +2062,7 @@ def main():
     
     # ==================== 训练循环 ====================
     
+    log_status(f"[Step8] 进入训练阶段，共 {args.epochs} 个 epoch")
     train_losses = []
     valid_losses = []
     test_losses = []
@@ -1735,10 +2083,13 @@ def main():
             swanlab.log({"optimizer/warmup_factor": warmup_factor})
         
         # 训练
+        print(f"[Epoch {epoch}/{args.epochs}] 开始训练...", flush=True)
         train_loss = train_epoch(
             model, device, train_loader, optimizer,
             loss_fn=loss_fn,
-            grad_accum_steps=args.grad_accum_steps
+            grad_accum_steps=args.grad_accum_steps,
+            use_tqdm=True,
+            progress_desc=f"Train {epoch}/{args.epochs}"
         )
         train_losses.append(train_loss)
         
@@ -1840,6 +2191,14 @@ def main():
                 })
 
         swanlab.log(log_payload)
+        summary_msg = (
+            f"[Epoch {epoch}/{args.epochs}] 训练完成 | "
+            f"train_loss={train_loss:.6f}, valid_loss={valid_loss:.6f}, "
+            f"id_test_loss={id_test_loss:.6f}, lr={current_lr:.6f}"
+        )
+        if ood_test_metrics is not None:
+            summary_msg += f", ood_loss={ood_test_metrics.get('avg_loss', 0):.6f}"
+        log_status(f"[Step8] {summary_msg}")
         
         # 保存最佳模型（基于验证集）
         if valid_loss < best_valid_loss:
@@ -1921,40 +2280,40 @@ def main():
         
         print(f"训练完成! 最佳模型 ({args.target_metric.upper()}):")
         print(f"  Epoch: {best_epoch}")
-        print(f"  [ID] 设计MAE: {best_test.get('design_mae', 0):.6f}")
-        print(f"  [ID] 设计RMSE: {best_test.get('design_rmse', 0):.6f}")
-        print(f"  [ID] 设计MAPE: {best_test.get('design_mape', 0):.2f}%")
-        print(f"  [ID] 设计ulti-RMSE: {best_test.get('design_ulti_rmse', 0):.8f}")
-        print(f"  [ID] 设计R²: {best_test.get('design_r2', 0):.4f}")
-        print(f"  [ID] Kernel MAE: {best_test.get('kernel_mae', 0):.6f}")
-        print(f"  [ID] Kernel RMSE: {best_test.get('kernel_rmse', 0):.6f}")
-        print(f"  [ID] Kernel MAPE: {best_test.get('kernel_mape', 0):.2f}%")
-        print(f"  [ID] Kernel ulti-RMSE: {best_test.get('kernel_ulti_rmse', 0):.8f}")
-        print(f"  [ID] Kernel R²: {best_test.get('kernel_r2', 0):.4f}")
+        print(f"  [ID] design MAE: {best_test.get('design_mae', 0):.6f}")
+        print(f"  [ID] design RMSE: {best_test.get('design_rmse', 0):.6f}")
+        print(f"  [ID] design MAPE: {best_test.get('design_mape', 0):.2f}%")
+        print(f"  [ID] design ulti-RMSE: {best_test.get('design_ulti_rmse', 0):.8f}")
+        print(f"  [ID] design R²: {best_test.get('design_r2', 0):.4f}")
+        print(f"  [ID] kernel MAE: {best_test.get('kernel_mae', 0):.6f}")
+        print(f"  [ID] kernel RMSE: {best_test.get('kernel_rmse', 0):.6f}")
+        print(f"  [ID] kernel MAPE: {best_test.get('kernel_mape', 0):.2f}%")
+        print(f"  [ID] kernel ulti-RMSE: {best_test.get('kernel_ulti_rmse', 0):.8f}")
+        print(f"  [ID] kernel R²: {best_test.get('kernel_r2', 0):.4f}")
         if 'delta_mae' in best_test:
-            print(f"  [ID] 差值MAE: {best_test.get('delta_mae', 0):.6f}")
-            print(f"  [ID] 差值RMSE: {best_test.get('delta_rmse', 0):.6f}")
-            print(f"  [ID] 差值MAPE: {best_test.get('delta_mape', 0):.2f}%")
-            print(f"  [ID] 差值ulti-RMSE: {best_test.get('delta_ulti_rmse', 0):.8f}")
-            print(f"  [ID] 差值R²: {best_test.get('delta_r2', 0):.4f}")
+            print(f"  [ID] delta MAE: {best_test.get('delta_mae', 0):.6f}")
+            print(f"  [ID] delta RMSE: {best_test.get('delta_rmse', 0):.6f}")
+            print(f"  [ID] delta MAPE: {best_test.get('delta_mape', 0):.2f}%")
+            print(f"  [ID] delta ulti-RMSE: {best_test.get('delta_ulti_rmse', 0):.8f}")
+            print(f"  [ID] delta R²: {best_test.get('delta_r2', 0):.4f}")
         if 'ood_test_loader' in locals() and ood_test_loader is not None:
             if best_ood_metrics is not None:
-                print(f"  [OOD] 设计MAE: {best_ood_metrics.get('design_mae', 0):.6f}")
-                print(f"  [OOD] 设计RMSE: {best_ood_metrics.get('design_rmse', 0):.6f}")
-                print(f"  [OOD] 设计MAPE: {best_ood_metrics.get('design_mape', 0):.2f}%")
-                print(f"  [OOD] 设计ulti-RMSE: {best_ood_metrics.get('design_ulti_rmse', 0):.8f}")
-                print(f"  [OOD] 设计R²: {best_ood_metrics.get('design_r2', 0):.4f}")
-                print(f"  [OOD] Kernel MAE: {best_ood_metrics.get('kernel_mae', 0):.6f}")
-                print(f"  [OOD] Kernel RMSE: {best_ood_metrics.get('kernel_rmse', 0):.6f}")
-                print(f"  [OOD] Kernel MAPE: {best_ood_metrics.get('kernel_mape', 0):.2f}%")
-                print(f"  [OOD] Kernel ulti-RMSE: {best_ood_metrics.get('kernel_ulti_rmse', 0):.8f}")
-                print(f"  [OOD] Kernel R²: {best_ood_metrics.get('kernel_r2', 0):.4f}")
+                print(f"  [OOD] design MAE: {best_ood_metrics.get('design_mae', 0):.6f}")
+                print(f"  [OOD] design RMSE: {best_ood_metrics.get('design_rmse', 0):.6f}")
+                print(f"  [OOD] design MAPE: {best_ood_metrics.get('design_mape', 0):.2f}%")
+                print(f"  [OOD] design ulti-RMSE: {best_ood_metrics.get('design_ulti_rmse', 0):.8f}")
+                print(f"  [OOD] design R²: {best_ood_metrics.get('design_r2', 0):.4f}")
+                print(f"  [OOD] kernel MAE: {best_ood_metrics.get('kernel_mae', 0):.6f}")
+                print(f"  [OOD] kernel RMSE: {best_ood_metrics.get('kernel_rmse', 0):.6f}")
+                print(f"  [OOD] kernel MAPE: {best_ood_metrics.get('kernel_mape', 0):.2f}%")
+                print(f"  [OOD] kernel ulti-RMSE: {best_ood_metrics.get('kernel_ulti_rmse', 0):.8f}")
+                print(f"  [OOD] kernel R²: {best_ood_metrics.get('kernel_r2', 0):.4f}")
                 if 'delta_mae' in best_ood_metrics:
-                    print(f"  [OOD] 差值MAE: {best_ood_metrics.get('delta_mae', 0):.6f}")
-                    print(f"  [OOD] 差值RMSE: {best_ood_metrics.get('delta_rmse', 0):.6f}")
-                    print(f"  [OOD] 差值MAPE: {best_ood_metrics.get('delta_mape', 0):.2f}%")
-                    print(f"  [OOD] 差值ulti-RMSE: {best_ood_metrics.get('delta_ulti_rmse', 0):.8f}")
-                    print(f"  [OOD] 差值R²: {best_ood_metrics.get('delta_r2', 0):.4f}")
+                    print(f"  [OOD] delta MAE: {best_ood_metrics.get('delta_mae', 0):.6f}")
+                    print(f"  [OOD] delta RMSE: {best_ood_metrics.get('delta_rmse', 0):.6f}")
+                    print(f"  [OOD] delta MAPE: {best_ood_metrics.get('delta_mape', 0):.2f}%")
+                    print(f"  [OOD] delta ulti-RMSE: {best_ood_metrics.get('delta_ulti_rmse', 0):.8f}")
+                    print(f"  [OOD] delta R²: {best_ood_metrics.get('delta_r2', 0):.4f}")
     
     # 保存训练历史 - 清理tensor数据避免JSON序列化错误
     clean_valid_history = []
@@ -2120,6 +2479,7 @@ def main():
     
     # 上传图片到SwanLab
     swanlab.log({"training_curves": swanlab.Image(plot_path)})
+    log_status("[Step9] 训练阶段完成，曲线图已保存并上传")
 
     # 可选：保存最终epoch的模型（用于对比分析，但论文通常使用best model）
     # 在学术论文中，通常使用验证集上的最佳模型更公平和标准

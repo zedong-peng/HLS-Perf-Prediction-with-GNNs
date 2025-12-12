@@ -17,27 +17,24 @@ trap cleanup SIGINT SIGTERM
 
 
 
-# features=("ff" "dsp" "lut")
-features=("ff" "dsp")
+features=("ff" "dsp" "lut")
 
+# exp2: delta GNN
 differentials=("true")
 hierarchical=("off")
 region=("on")
-
-# differentials=("false")
-# hierarchical=("off")
-# region=("off")
+use_code_feature=("False")
 
 # from fast to slow
 # gnn=("gcn" "fast_rgcn" "rgcn" "gin" "pna")
-
 gnn=("pna")
 
 
 # design_base_dir
-# design_base_dir=("/home/user/zedongpeng/workspace/Huggingface/forgehls_lite_100designs")
-# design_base_dir=("/home/user/zedongpeng/workspace/Huggingface/forgehls_PolyBench_part_250designs")
-design_base_dir=("/home/user/zedongpeng/workspace/Huggingface/new_polybench_without_attribution_pragma_50designs")
+# design_base_dir="/home/user/zedongpeng/workspace/Huggingface/forgehls_lite_100designs"
+design_base_dir="/home/user/zedongpeng/workspace/Huggingface/forgehls_PolyBench_part_250designs"
+# design_base_dir="/home/user/zedongpeng/workspace/Huggingface/new_polybench_without_attribution_pragma_50designs"
+# design_base_dir="/home/user/zedongpeng/workspace/Huggingface/forgehls_PolyBench_part_500designs"
 
 # 串行运行，减少总内存占用；并配置更保守的内存参数
 # 4090 当前配置下可稳定执行3个训练任务
@@ -48,10 +45,10 @@ for differential in "${differentials[@]}"; do
     for gnn_type in "${gnn[@]}"; do
       for h in "${hierarchical[@]}"; do
         for r in "${region[@]}"; do
-          echo "Running: $differential | $feature | $gnn_type | $h | $r"
+          echo "Running exp2 (no code): $differential | $feature | $gnn_type | $h | $r"
           python train_e2e.py \
           --kernel_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_kernels \
-          --design_base_dir $design_base_dir \
+          --design_base_dir "$design_base_dir" \
           --output_dir ./output \
           --cache_root ./graph_cache \
           --gnn_type $gnn_type \
@@ -78,6 +75,7 @@ for differential in "${differentials[@]}"; do
     done
   done
 done
+
 wait
 
 echo "所有训练任务已完成！"
