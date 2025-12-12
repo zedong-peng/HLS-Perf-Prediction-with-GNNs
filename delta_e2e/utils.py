@@ -435,10 +435,6 @@ def parse_xml_into_graph_single(xml_file: str, hierarchical: bool = False, regio
                 G.nodes[n]['region_ii'] = G.nodes[n].get('region_ii', 0)
                 G.nodes[n]['region_pipe_depth'] = G.nodes[n].get('region_pipe_depth', 0)
 
-        pipeline_region_count = 0
-        ii_values: List[int] = []
-        pipe_depth_values: List[int] = []
-
         # 收集区域以便分层模式创建节点
         region_records = []  # (region_key, is_pipelined, ii, depth, basic_block_ids)
 
@@ -477,68 +473,6 @@ def parse_xml_into_graph_single(xml_file: str, hierarchical: bool = False, regio
             # 记录区域信息用于层次化
             region_key = reg.findtext('mTag', default=f'region_{idx}') or f'region_{idx}'
             region_records.append((region_key, is_pipelined, max(0, mII if mII and mII > 0 else 0), max(0, mDepth if mDepth and mDepth > 0 else 0), bb_ids))
-
-            if is_pipelined:
-                pipeline_region_count += 1
-                if mII is not None and mII > 0:
-                    ii_values.append(mII)
-                if mDepth is not None and mDepth > 0:
-                    pipe_depth_values.append(mDepth)
-
-        # 顶层 regions: interval/pipe_depth（仅用于全局旁证）
-        top_intervals: List[int] = []
-        top_pipe_depths: List[int] = []
-        for reg in root.findall('.//regions//item'):
-            try:
-                iv = int(reg.findtext('interval', default='0'))
-            except Exception:
-                iv = 0
-            try:
-                pd = int(reg.findtext('pipe_depth', default='0'))
-            except Exception:
-                pd = 0
-            if iv > 0:
-                top_intervals.append(iv)
-            if pd > 0:
-                top_pipe_depths.append(pd)
-
-        # 资源/信号旁证
-        pipeline_components_present = 0
-        pipeline_signals_present = 0
-        try:
-            for it in root.findall('.//res/dp_component_resource//item/first'):
-                txt = (it.text or '').lower()
-                if 'flow_control_loop_pipe' in txt:
-                    pipeline_components_present = 1
-                    break
-        except Exception:
-            pass
-        try:
-            # 迭代寄存器/多路复用相关
-            for it in root.findall('.//res/dp_register_resource//item/first'):
-                if it is not None and it.text and 'ap_enable_reg_pp' in it.text:
-                    pipeline_signals_present = 1
-                    break
-            if pipeline_signals_present == 0:
-                for it in root.findall('.//res/dp_multiplexer_resource//item/first'):
-                    if it is not None and it.text and 'ap_enable_reg_pp' in it.text:
-                        pipeline_signals_present = 1
-                        break
-        except Exception:
-            pass
-
-        # 计算全局指标
-        avg_ii = float(sum(ii_values) / len(ii_values)) if ii_values else 0.0
-        max_pipe_depth = int(max(pipe_depth_values) if pipe_depth_values else (max(top_pipe_depths) if top_pipe_depths else 0))
-        has_pipeline = 1 if (pipeline_region_count > 0 or len(top_intervals) > 0 or max_pipe_depth > 0 or pipeline_components_present == 1 or pipeline_signals_present == 1) else 0
-
-        # 写入到图的全局属性
-        G.graph['has_pipeline'] = has_pipeline
-        G.graph['pipeline_region_count'] = pipeline_region_count
-        G.graph['avg_ii'] = avg_ii
-        G.graph['max_pipe_depth'] = max_pipe_depth
-        G.graph['pipeline_components_present'] = pipeline_components_present
-        G.graph['pipeline_signals_present'] = pipeline_signals_present
 
         # 分层模式：增加区域节点与包含关系边（独立于 region 标志）
         if hierarchical and region_records:

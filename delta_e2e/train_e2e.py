@@ -669,17 +669,7 @@ class E2EDifferentialProcessor:
             edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
             edge_attr = torch.tensor(edge_features, dtype=torch.float) if edge_features else None
             
-            # 携带图级流水线属性（若存在）
             data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
-            try:
-                data.has_pipeline = int(G.graph.get('has_pipeline', 0))
-                data.pipeline_region_count = int(G.graph.get('pipeline_region_count', 0))
-                data.avg_ii = float(G.graph.get('avg_ii', 0.0))
-                data.max_pipe_depth = int(G.graph.get('max_pipe_depth', 0))
-                data.pipeline_components_present = int(G.graph.get('pipeline_components_present', 0))
-                data.pipeline_signals_present = int(G.graph.get('pipeline_signals_present', 0))
-            except Exception:
-                pass
             
             return data
             
@@ -711,14 +701,6 @@ class E2EDifferentialProcessor:
             all_edge_attr: List[torch.Tensor] = []
             node_offset = 0
 
-            # 聚合图级流水线指标
-            has_pipeline_any = 0
-            pipeline_region_count_sum = 0
-            avg_ii_list: List[float] = []
-            max_pipe_depth_max = 0
-            components_any = 0
-            signals_any = 0
-
             for data in datas:
                 x = data.x
                 ei = data.edge_index + node_offset
@@ -728,21 +710,6 @@ class E2EDifferentialProcessor:
                 all_edge_index.append(ei)
                 all_edge_attr.append(ea)
 
-                # 聚合图级属性
-                try:
-                    has_pipeline_any = max(has_pipeline_any, int(getattr(data, 'has_pipeline', 0)))
-                    pipeline_region_count_sum += int(getattr(data, 'pipeline_region_count', 0))
-                    ai = float(getattr(data, 'avg_ii', 0.0))
-                    if ai > 0:
-                        avg_ii_list.append(ai)
-                    mpd = int(getattr(data, 'max_pipe_depth', 0))
-                    if mpd > max_pipe_depth_max:
-                        max_pipe_depth_max = mpd
-                    components_any = max(components_any, int(getattr(data, 'pipeline_components_present', 0)))
-                    signals_any = max(signals_any, int(getattr(data, 'pipeline_signals_present', 0)))
-                except Exception:
-                    pass
-
                 node_offset += x.size(0)
 
             # 合并
@@ -751,13 +718,6 @@ class E2EDifferentialProcessor:
             edge_attr_cat = torch.cat(all_edge_attr, dim=0) if all_edge_attr else None
 
             data_merged = Data(x=x_cat, edge_index=edge_index_cat, edge_attr=edge_attr_cat)
-            # 写入聚合属性
-            data_merged.has_pipeline = has_pipeline_any
-            data_merged.pipeline_region_count = pipeline_region_count_sum
-            data_merged.avg_ii = (sum(avg_ii_list) / len(avg_ii_list)) if avg_ii_list else 0.0
-            data_merged.max_pipe_depth = max_pipe_depth_max
-            data_merged.pipeline_components_present = components_any
-            data_merged.pipeline_signals_present = signals_any
             data_merged.num_modules = len(datas)
 
             return data_merged
@@ -1021,27 +981,6 @@ class E2EDifferentialProcessor:
                     edge_attr=torch.tensor(d_data['edge_attr'], dtype=torch.float) if d_data['edge_attr'] else None,
                     y=torch.tensor(d_data['y'], dtype=torch.float)
                 )
-
-                try:
-                    k_meta = cached_pair.get('kernel_graph_meta', {})
-                    kernel_graph.has_pipeline = int(k_meta.get('has_pipeline', 0))
-                    kernel_graph.pipeline_region_count = int(k_meta.get('pipeline_region_count', 0))
-                    kernel_graph.avg_ii = float(k_meta.get('avg_ii', 0.0))
-                    kernel_graph.max_pipe_depth = int(k_meta.get('max_pipe_depth', 0))
-                    kernel_graph.pipeline_components_present = int(k_meta.get('pipeline_components_present', 0))
-                    kernel_graph.pipeline_signals_present = int(k_meta.get('pipeline_signals_present', 0))
-                except Exception:
-                    pass
-                try:
-                    d_meta = cached_pair.get('design_graph_meta', {})
-                    design_graph.has_pipeline = int(d_meta.get('has_pipeline', 0))
-                    design_graph.pipeline_region_count = int(d_meta.get('pipeline_region_count', 0))
-                    design_graph.avg_ii = float(d_meta.get('avg_ii', 0.0))
-                    design_graph.max_pipe_depth = int(d_meta.get('max_pipe_depth', 0))
-                    design_graph.pipeline_components_present = int(d_meta.get('pipeline_components_present', 0))
-                    design_graph.pipeline_signals_present = int(d_meta.get('pipeline_signals_present', 0))
-                except Exception:
-                    pass
 
                 pair = {
                     'pair_id': cached_pair['pair_id'],
@@ -1754,8 +1693,8 @@ def main():
                         help='是否启用 region 信息（构图元数据中记录），on/off')
 
     # 并行构建图cache参数
-    parser.add_argument('--max_workers', type=int, default=24,
-                        help='数据处理并行线程/进程数（默认24；<=0 表示自动选择）')
+    parser.add_argument('--max_workers', type=int, default=32,
+                        help='数据处理并行线程/进程数（<=0 表示自动选择）')
     
     # 模型保存选项
     parser.add_argument('--save_final_model', action='store_true',
@@ -1857,14 +1796,6 @@ def main():
     })
     swanlab.log({"config/loss_type": swanlab.Text(args.loss_type)})
     # 记录流水线旁证的总体占比（设计图）
-    try:
-        has_pipe_count = sum(int(getattr(p['design_graph'], 'has_pipeline', 0)) for p in pairs)
-        swanlab.log({
-            "dataset/has_pipeline_ratio": has_pipe_count / max(1, len(pairs))
-        })
-    except Exception:
-        pass
-
     # 限制配对数量（调试用）
     if args.max_pairs and len(pairs) > args.max_pairs:
         pairs = pairs[:args.max_pairs]
@@ -1881,18 +1812,6 @@ def main():
             'design_id': pair['design_info']['design_id'],
             'pragma_count': pair['pragma_info']['pragma_count'],
             'performance_delta': pair['performance_delta'],
-            # 记录图级流水相关旁证（设计图）
-            'design_has_pipeline': int(getattr(pair['design_graph'], 'has_pipeline', 0)),
-            'design_pipeline_region_count': int(getattr(pair['design_graph'], 'pipeline_region_count', 0)),
-            'design_avg_ii': float(getattr(pair['design_graph'], 'avg_ii', 0.0)),
-            'design_max_pipe_depth': int(getattr(pair['design_graph'], 'max_pipe_depth', 0)),
-            'design_pipeline_components_present': int(getattr(pair['design_graph'], 'pipeline_components_present', 0)),
-            'design_pipeline_signals_present': int(getattr(pair['design_graph'], 'pipeline_signals_present', 0)),
-            # kernel 旁证（便于差分分析）
-            'kernel_has_pipeline': int(getattr(pair['kernel_graph'], 'has_pipeline', 0)),
-            'kernel_pipeline_region_count': int(getattr(pair['kernel_graph'], 'pipeline_region_count', 0)),
-            'kernel_avg_ii': float(getattr(pair['kernel_graph'], 'avg_ii', 0.0)),
-            'kernel_max_pipe_depth': int(getattr(pair['kernel_graph'], 'max_pipe_depth', 0)),
         }
         pairs_info.append(info)
     
