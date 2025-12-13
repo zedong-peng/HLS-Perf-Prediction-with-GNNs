@@ -50,6 +50,11 @@ import multiprocessing as mp
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+try:
+    mp.set_sharing_strategy("file_descriptor")  # avoid /dev/shm mmap errors
+except Exception:
+    pass
+
 _shutdown_requested = False
 
 
@@ -81,6 +86,17 @@ def _graceful_cleanup():
         swanlab.finish()
     except Exception:
         pass
+
+
+def _configure_mp(start_method: str):
+    """Configure multiprocessing start method early to control DataLoader worker behavior."""
+    current = mp.get_start_method(allow_none=True)
+    if current == start_method:
+        return
+    try:
+        mp.set_start_method(start_method, force=True)
+    except Exception as exc:
+        log_status(f"[MP] Failed to set start_method={start_method}: {exc}")
 
 
 def _signal_handler(signum, frame):
@@ -1314,11 +1330,89 @@ def differential_collate_fn(batch):
 
 
 # ============================================================================
+# Target statistics & normalization
+# ============================================================================
+
+
+class RobustScaler:
+    """Robust缩放器：使用median/IQR（退回std）进行归一化。"""
+
+    def __init__(self, median: float, scale: float, p05: float, p95: float, p25: float, p75: float):
+        self.median = float(median)
+        self.scale = float(scale) if scale > 1e-12 else 1e-12
+        self.p05 = float(p05)
+        self.p95 = float(p95)
+        self.p25 = float(p25)
+        self.p75 = float(p75)
+
+    def transform_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        median = torch.tensor(self.median, device=tensor.device, dtype=tensor.dtype)
+        scale = torch.tensor(self.scale, device=tensor.device, dtype=tensor.dtype)
+        return (tensor - median) / scale
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            "median": self.median,
+            "scale": self.scale,
+            "p05": self.p05,
+            "p25": self.p25,
+            "p75": self.p75,
+            "p95": self.p95
+        }
+
+
+def _compute_basic_stats(values: List[float]) -> Dict[str, float]:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return {}
+    p05, p25, p50, p75, p95 = np.percentile(arr, [5, 25, 50, 75, 95])
+    return {
+        "count": int(arr.size),
+        "min": float(arr.min()),
+        "max": float(arr.max()),
+        "mean": float(arr.mean()),
+        "std": float(arr.std(ddof=0)),
+        "median": float(p50),
+        "p05": float(p05),
+        "p25": float(p25),
+        "p75": float(p75),
+        "p95": float(p95)
+    }
+
+
+def _extract_metric_values(pairs: List[Dict], metric_idx: int, delta_key: str) -> Dict[str, List[float]]:
+    kernel_vals: List[float] = []
+    design_vals: List[float] = []
+    delta_vals: List[float] = []
+    for pair in pairs:
+        kernel_vals.append(float(pair['kernel_graph'].y[0, metric_idx].item()))
+        design_vals.append(float(pair['design_graph'].y[0, metric_idx].item()))
+        delta_vals.append(float(pair['performance_delta'][delta_key]))
+    return {"kernel": kernel_vals, "design": design_vals, "delta": delta_vals}
+
+
+def _fit_robust_scaler(values: List[float]) -> RobustScaler:
+    stats = _compute_basic_stats(values)
+    scale = stats["p75"] - stats["p25"]
+    if scale <= 1e-12:
+        scale = stats["std"] if stats["std"] > 1e-12 else 1.0
+    return RobustScaler(
+        median=stats["median"],
+        scale=scale,
+        p05=stats["p05"],
+        p25=stats["p25"],
+        p75=stats["p75"],
+        p95=stats["p95"]
+    )
+
+
+# ============================================================================
 # Training Functions
 # ============================================================================
 
 def train_epoch(model, device, train_loader, optimizer, loss_fn=None, grad_accum_steps=1,
-               max_grad_norm=1.0, use_tqdm: bool = False, progress_desc: Optional[str] = None):
+               max_grad_norm=1.0, use_tqdm: bool = False, progress_desc: Optional[str] = None,
+               normalizers: Optional[Dict[str, RobustScaler]] = None):
     """训练一个epoch"""
     model.train()
     loss_fn = loss_fn or F.l1_loss
@@ -1349,6 +1443,11 @@ def train_epoch(model, device, train_loader, optimizer, loss_fn=None, grad_accum
             'design_perf': batch['design_perf'].to(device, non_blocking=True),
             'performance_delta': batch['performance_delta'].to(device, non_blocking=True)
         }
+
+        def _norm(tensor: torch.Tensor, key: str) -> torch.Tensor:
+            if normalizers and key in normalizers and normalizers[key] is not None:
+                return normalizers[key].transform_tensor(tensor)
+            return tensor
         
         if model.differential:
             design_pred = predictions['design_pred'].squeeze()
@@ -1359,15 +1458,15 @@ def train_epoch(model, device, train_loader, optimizer, loss_fn=None, grad_accum
             target_delta = targets['performance_delta'].squeeze()
             target_kernel = targets['kernel_perf'].squeeze()
 
-            design_loss = loss_fn(design_pred, target_design)
-            delta_loss = loss_fn(delta_pred, target_delta)
-            kernel_loss = loss_fn(kernel_pred, target_kernel)
+            design_loss = loss_fn(_norm(design_pred, 'design'), _norm(target_design, 'design'))
+            delta_loss = loss_fn(_norm(delta_pred, 'delta'), _norm(target_delta, 'delta'))
+            kernel_loss = loss_fn(_norm(kernel_pred, 'kernel'), _norm(target_kernel, 'kernel'))
 
             loss = kernel_loss + delta_loss + 0.2 * design_loss
         else:
             design_pred = predictions['direct_pred'].squeeze()
             target_design = targets['design_perf'].squeeze()
-            loss = loss_fn(design_pred, target_design)
+            loss = loss_fn(_norm(design_pred, 'design'), _norm(target_design, 'design'))
         
         # 梯度累积缩放
         loss_scaled = loss / max(1, grad_accum_steps)
@@ -1390,7 +1489,8 @@ def train_epoch(model, device, train_loader, optimizer, loss_fn=None, grad_accum
     return (loss_sum_gpu.item() / batch_count) if batch_count > 0 else float('inf')
 
 
-def evaluate_model(model, data_loader, device, target_metric='dsp', return_predictions=False, loss_fn=None):
+def evaluate_model(model, data_loader, device, target_metric='dsp', return_predictions=False, loss_fn=None,
+                   normalizers: Optional[Dict[str, RobustScaler]] = None):
     """评估模型性能 - 返回设计绝对指标并可选记录差值诊断信息"""
     model.eval()
     loss_fn = loss_fn or F.l1_loss
@@ -1424,6 +1524,11 @@ def evaluate_model(model, data_loader, device, target_metric='dsp', return_predi
                 'performance_delta': batch['performance_delta'].to(device)
             }
 
+            def _norm(tensor: torch.Tensor, key: str) -> torch.Tensor:
+                if normalizers and key in normalizers and normalizers[key] is not None:
+                    return normalizers[key].transform_tensor(tensor)
+                return tensor
+
             if model.differential:
                 # 差分模式：预测 kernel、delta，并组合成设计指标
                 design_pred = predictions['design_pred'].squeeze()
@@ -1434,9 +1539,9 @@ def evaluate_model(model, data_loader, device, target_metric='dsp', return_predi
                 delta_true = targets['performance_delta'].squeeze()
                 kernel_true = targets['kernel_perf'].squeeze()
 
-                design_loss = loss_fn(design_pred, target_design)
-                delta_loss = loss_fn(delta_pred, delta_true)
-                kernel_loss = loss_fn(kernel_pred, kernel_true)
+                design_loss = loss_fn(_norm(design_pred, 'design'), _norm(target_design, 'design'))
+                delta_loss = loss_fn(_norm(delta_pred, 'delta'), _norm(delta_true, 'delta'))
+                kernel_loss = loss_fn(_norm(kernel_pred, 'kernel'), _norm(kernel_true, 'kernel'))
                 total_batch_loss = kernel_loss + delta_loss + 0.2 * design_loss
             else:
                 design_pred = predictions['direct_pred'].squeeze()
@@ -1446,7 +1551,7 @@ def evaluate_model(model, data_loader, device, target_metric='dsp', return_predi
                 kernel_pred = None
                 kernel_true = None
 
-                design_loss = loss_fn(design_pred, target_design)
+                design_loss = loss_fn(_norm(design_pred, 'design'), _norm(target_design, 'design'))
                 total_batch_loss = design_loss
 
             total_loss += total_batch_loss.item()
@@ -1653,6 +1758,9 @@ def main():
     parser.add_argument('--loader_workers', type=int, default=8, help='DataLoader worker 数量（>0 启用多进程加载）')
     parser.add_argument('--prefetch_factor', type=int, default=4, help='DataLoader 预取批数（num_workers>0 时有效）')
     parser.add_argument('--persistent_workers', type=str, default='true', choices=['true', 'false'], help='是否持久化 DataLoader workers')
+    parser.add_argument('--loader_start_method', type=str, default='spawn',
+                        choices=['spawn', 'fork'],
+                        help='DataLoader worker 启动方式（spawn 更安全，fork 更快但可能与 CUDA 线程冲突）')
     # 新增：控制 DataLoader 是否使用 pinned memory（大数据集/CPU 内存紧张时建议关闭）
     parser.add_argument('--pin_memory', type=str, default='true', choices=['true', 'false'], help='是否使用 DataLoader pin_memory')
     
@@ -1684,6 +1792,10 @@ def main():
     # 训练策略参数
     parser.add_argument('--warmup_epochs', type=int, default=5, help='Linear warmup 的 epoch 数（0 表示关闭）')
     parser.add_argument('--min_lr', type=float, default=1e-5, help='学习率下限（避免过小导致训练停滞）')
+    parser.add_argument('--apply_hard_filter', type=str, default='true', choices=['true', 'false'],
+                        help='是否过滤无效设计（基于稳健分位 p05-p95）')
+    parser.add_argument('--normalize_targets', type=str, default='true', choices=['true', 'false'],
+                        help='是否对目标值/差值使用稳健归一化（median/IQR）用于计算loss')
     
     # 层次化图开关
     parser.add_argument('--hierarchical', type=str, default='off', choices=['on', 'off'],
@@ -1707,6 +1819,8 @@ def main():
     code_normalize = (args.code_normalize.lower() == 'true')
     if use_code_feature and not args.code_model_path:
         raise ValueError("use_code_feature=true 时必须提供 --code_model_path")
+
+    _configure_mp(args.loader_start_method)
     
     # 设置设备
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
@@ -1776,12 +1890,12 @@ def main():
             code_normalize=code_normalize,
             code_batch_size=args.code_batch_size
         )
-        log_status("[Step4] 开始构建/加载OOD图缓存并生成kernel-design配对")
+        log_status("[Step5] 开始构建/加载OOD图缓存并生成kernel-design配对")
         ood_pairs = ood_processor.collect_all_data()
-        log_status(f"[Step4] OOD 图缓存与配对完成，获得 {len(ood_pairs)} 条记录")
+        log_status(f"[Step5] OOD 图缓存与配对完成，获得 {len(ood_pairs)} 条记录")
     else:
         print(f"提示: OOD 路径不可用或未提供，将跳过 OOD 评估: {args.ood_design_base_dir}")
-        log_status("[Step4] 未提供 OOD 路径，跳过 OOD 评估阶段")
+        log_status("[Step5] 未提供 OOD 路径，跳过 OOD 评估阶段")
     
     # 记录数据集信息
     swanlab.log({"dataset/total_pairs": len(pairs)})
@@ -1801,6 +1915,42 @@ def main():
         pairs = pairs[:args.max_pairs]
         swanlab.log({"dataset/limited_pairs": args.max_pairs})
         log_status(f"[Step3.6] 调试模式：截断配对数至 {args.max_pairs}")
+
+    # 统计原始分布并保存
+    metric_idx = {'dsp': 0, 'lut': 1, 'ff': 2, 'latency': 3}[args.target_metric]
+    delta_key = f'{args.target_metric}_delta' if args.target_metric != 'latency' else 'latency_delta'
+    raw_stats = {k: _compute_basic_stats(v) for k, v in _extract_metric_values(pairs, metric_idx, delta_key).items()}
+    stats_path = os.path.join(output_dir, 'target_metric_stats.json')
+    with open(stats_path, 'w') as sf:
+        json.dump({"raw": raw_stats}, sf, indent=2)
+    log_status(f"[Step4] 已统计原始分布并写入 {stats_path}")
+    swanlab.log({f"stats/raw/{k}/p05": v.get("p05", float('nan')) for k, v in raw_stats.items() if v})
+    swanlab.log({f"stats/raw/{k}/p95": v.get("p95", float('nan')) for k, v in raw_stats.items() if v})
+
+    # p05-p95 硬过滤（保持 10% avail 过滤基础上）
+    if args.apply_hard_filter.lower() == 'true':
+        thresholds = {k: (v["p05"], v["p95"]) for k, v in raw_stats.items() if v}
+        before = len(pairs)
+        filtered_pairs: List[Dict] = []
+        for pair in pairs:
+            vals = _extract_metric_values([pair], metric_idx, delta_key)
+            keep = True
+            for key, (low, high) in thresholds.items():
+                value = vals[key][0]
+                if value < low or value > high:
+                    keep = False
+                    break
+            if keep:
+                filtered_pairs.append(pair)
+        pairs = filtered_pairs
+        dropped = before - len(pairs)
+        log_status(f"[Step4.1] 过滤无效设计（p05-p95），移除 {dropped} 条，剩余 {len(pairs)} 条")
+        swanlab.log({
+            "dataset/hard_filter_dropped": dropped,
+            "dataset/after_hard_filter": len(pairs)
+        })
+    if not pairs:
+        raise ValueError("硬过滤后无有效样本，请调整过滤阈值或关闭 --apply_hard_filter")
     
     # 保存配对信息
     pairs_info = []
@@ -1821,13 +1971,27 @@ def main():
     
     # 不再上传表格形式的配对信息，保留 JSON 文件以便线下查看
     
+    # 更新过滤后分布
+    filtered_stats = {k: _compute_basic_stats(v) for k, v in _extract_metric_values(pairs, metric_idx, delta_key).items()}
+    try:
+        with open(stats_path, 'r') as sf:
+            prev_stats = json.load(sf)
+    except Exception:
+        prev_stats = {}
+    prev_stats["filtered"] = filtered_stats
+    with open(stats_path, 'w') as sf:
+        json.dump(prev_stats, sf, indent=2)
+    log_status(f"[Step4.2] 过滤后分布已追加至 {stats_path}")
+
     # 创建数据集
     dataset = E2EDifferentialDataset(pairs, args.target_metric)
     ood_dataset = E2EDifferentialDataset(ood_pairs, args.target_metric) if ood_pairs else None
     
     # 数据集划分 - 8:1:1随机划分
-    log_status("[Step5] 开始构建数据集并执行 8:1:1 划分")
+    log_status("[Step6] 开始构建数据集并执行 8:1:1 划分")
     total_size = len(dataset)
+    if total_size == 0:
+        raise ValueError("预处理后数据集为空，无法继续训练。请放宽过滤阈值。")
     train_size = int(0.8 * total_size)
     valid_size = int(0.1 * total_size)
     test_size = total_size - train_size - valid_size
@@ -1841,7 +2005,7 @@ def main():
     valid_dataset = torch.utils.data.Subset(dataset, valid_indices)
     test_dataset = torch.utils.data.Subset(dataset, test_indices)
     ood_test_dataset = ood_dataset  if ood_dataset is not None else None
-    log_status(f"[Step5] 数据集划分完成: train={len(train_dataset)}, valid={len(valid_dataset)}, test={len(test_dataset)}")
+    log_status(f"[Step6] 数据集划分完成: train={len(train_dataset)}, valid={len(valid_dataset)}, test={len(test_dataset)}")
     
     # 记录数据划分信息
     swanlab.log({
@@ -1851,6 +2015,26 @@ def main():
     })
     
     # 不再以表格形式记录数据集划分；仅保留标量日志
+
+    # 基于训练集拟合稳健归一化器
+    normalizers: Optional[Dict[str, RobustScaler]] = None
+    if args.normalize_targets.lower() == 'true':
+        train_pairs = [pairs[int(i)] for i in train_indices.tolist()]
+        train_values = _extract_metric_values(train_pairs, metric_idx, delta_key)
+        if any(len(v) == 0 for v in train_values.values()):
+            raise ValueError("训练集目标值为空，无法拟合归一化器。请检查过滤配置。")
+        normalizers = {k: _fit_robust_scaler(v) for k, v in train_values.items()}
+        norm_stats = {k: v.to_dict() for k, v in normalizers.items()}
+        try:
+            with open(stats_path, 'r') as sf:
+                prev_stats = json.load(sf)
+        except Exception:
+            prev_stats = {}
+        prev_stats["normalizer"] = norm_stats
+        with open(stats_path, 'w') as sf:
+            json.dump(prev_stats, sf, indent=2)
+        log_status(f"[Step6.1] 已基于训练集拟合稳健归一化器并写入 {stats_path}")
+        swanlab.log({f"normalizer/{k}/scale": v.scale for k, v in normalizers.items()})
     
     # 创建数据加载器
     loader_workers = max(0, int(args.loader_workers))
@@ -1861,10 +2045,10 @@ def main():
         'pin_memory': (args.pin_memory.lower() == 'true'),
         'persistent_workers': (persistent if loader_workers > 0 else False)
     }
-    # 为 DataLoader 指定 spawn 上下文，确保 Ctrl+C 能可靠终止子进程
+    # 为 DataLoader 指定 worker 上下文，确保 Ctrl+C 能可靠终止子进程
     if loader_workers > 0:
         try:
-            loader_common_kwargs['multiprocessing_context'] = 'spawn'
+            loader_common_kwargs['multiprocessing_context'] = args.loader_start_method
         except Exception:
             pass
     if loader_workers > 0 and int(args.prefetch_factor) > 0:
@@ -1888,7 +2072,7 @@ def main():
             ood_test_dataset, batch_size=args.batch_size, shuffle=False,
             **loader_common_kwargs
         )
-    log_status("[Step6] DataLoader 构建完成，准备创建模型")
+    log_status("[Step7] DataLoader 构建完成，准备创建模型")
     
     # ==================== 创建模型 ====================
     
@@ -1956,11 +2140,11 @@ def main():
         use_code_feature=(args.use_code_feature.lower() == 'true'),
         code_dim=code_dim
     ).to(device)
-    log_status("[Step7] 模型初始化完成，开始训练循环准备")
+    log_status("[Step8] 模型初始化完成，开始训练循环准备")
     
     # 优化器和调度器
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=15)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=30)
     
     # 学习率工具函数
     def _set_optimizer_lr(optim_obj, lr_value):
@@ -1981,7 +2165,7 @@ def main():
     
     # ==================== 训练循环 ====================
     
-    log_status(f"[Step8] 进入训练阶段，共 {args.epochs} 个 epoch")
+    log_status(f"[Step9] 进入训练阶段，共 {args.epochs} 个 epoch")
     train_losses = []
     valid_losses = []
     test_losses = []
@@ -2007,6 +2191,7 @@ def main():
             model, device, train_loader, optimizer,
             loss_fn=loss_fn,
             grad_accum_steps=args.grad_accum_steps,
+            normalizers=normalizers,
             use_tqdm=True,
             progress_desc=f"Train {epoch}/{args.epochs}"
         )
@@ -2015,7 +2200,8 @@ def main():
         # 验证
         valid_metrics = evaluate_model(
             model, valid_loader, device, args.target_metric,
-            loss_fn=loss_fn
+            loss_fn=loss_fn,
+            normalizers=normalizers
         )
         valid_loss = valid_metrics['avg_loss']
         valid_losses.append(valid_loss)
@@ -2024,7 +2210,8 @@ def main():
         # ID 测试
         id_test_metrics = evaluate_model(
             model, test_loader, device, args.target_metric,
-            loss_fn=loss_fn
+            loss_fn=loss_fn,
+            normalizers=normalizers
         )
         id_test_loss = id_test_metrics['avg_loss']
         test_losses.append(id_test_loss)
@@ -2035,7 +2222,8 @@ def main():
         if ood_test_loader is not None:
             ood_test_metrics = evaluate_model(
                 model, ood_test_loader, device, args.target_metric,
-                loss_fn=loss_fn
+                loss_fn=loss_fn,
+                normalizers=normalizers
             )
             ood_metrics_history.append(ood_test_metrics)
         
@@ -2117,7 +2305,7 @@ def main():
         )
         if ood_test_metrics is not None:
             summary_msg += f", ood_loss={ood_test_metrics.get('avg_loss', 0):.6f}"
-        log_status(f"[Step8] {summary_msg}")
+        log_status(f"[Step9] {summary_msg}")
         
         # 保存最佳模型（基于验证集）
         if valid_loss < best_valid_loss:
@@ -2398,7 +2586,7 @@ def main():
     
     # 上传图片到SwanLab
     swanlab.log({"training_curves": swanlab.Image(plot_path)})
-    log_status("[Step9] 训练阶段完成，曲线图已保存并上传")
+    log_status("[Step10] 训练阶段完成，曲线图已保存并上传")
 
     # 可选：保存最终epoch的模型（用于对比分析，但论文通常使用best model）
     # 在学术论文中，通常使用验证集上的最佳模型更公平和标准
