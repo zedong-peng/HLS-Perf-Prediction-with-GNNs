@@ -26,7 +26,6 @@ METRIC_SPECS: Tuple[Tuple[str, str, str], ...] = (
     ("dsp", "DSP", "dsp_delta"),
     ("lut", "LUT", "lut_delta"),
     ("ff", "FF", "ff_delta"),
-    ("latency", "best_latency", "latency_delta"),
 )
 
 
@@ -44,6 +43,7 @@ def describe(values: Iterable[float]) -> Optional[Dict[str, float]]:
         "mean": float(array.mean()),
         "std": float(array.std(ddof=0)),
         "median": float(np.median(array)),
+        "p05": float(np.percentile(array, 5)),
         "p75": float(np.percentile(array, 75)),
         "p90": float(np.percentile(array, 90)),
         "p95": float(np.percentile(array, 95)),
@@ -69,6 +69,13 @@ def load_pairs(
     cache_root: str,
     hierarchical: bool = False,
     region: bool = False,
+    use_code_feature: bool = False,
+    code_model_path: Optional[str] = None,
+    code_pooling: str = "last_token",
+    code_max_length: int = 1024,
+    code_normalize: bool = True,
+    code_cache_root: Optional[str] = None,
+    code_batch_size: int = 8,
     allow_rebuild: bool = False,
     limit: Optional[int] = None,
 ) -> List[Dict]:
@@ -84,6 +91,13 @@ def load_pairs(
         hierarchical=hierarchical,
         region=region,
         max_workers=8,
+        use_code_feature=use_code_feature,
+        code_model_path=code_model_path,
+        code_pooling=code_pooling,
+        code_max_length=code_max_length,
+        code_normalize=code_normalize,
+        code_cache_root=code_cache_root,
+        code_batch_size=code_batch_size,
     )
 
     index_exists = os.path.exists(processor.index_path)
@@ -169,12 +183,13 @@ def pretty_print_summaries(summaries: Dict[str, Dict[str, Dict[str, float]]]) ->
                 continue
             print(f"[{section}] count={stats['count']}")
             print(
-                "  min={min:.4f} max={max:.4f} mean={mean:.4f} std={std:.4f} median={median:.4f}".format(
+                "  min={min:.4f} max={max:.4f} mean={mean:.4f} std={std:.4f} median={median:.4f} p05={p05:.4f}".format(
                     min=stats["min"],
                     max=stats["max"],
                     mean=stats["mean"],
                     std=stats["std"],
                     median=stats["median"],
+                    p05=stats["p05"],
                 )
             )
             print(
@@ -202,6 +217,13 @@ def main() -> None:
     parser.add_argument("--cache_root", default="/home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/graph_cache", help="graph cache 根目录")
     parser.add_argument("--hierarchical", action="store_true", help="与训练时一致：若开启多层次构图则加此开关")
     parser.add_argument("--region", action="store_true", help="与训练时一致：若缓存包含 region 信息则加此开关")
+    parser.add_argument("--use_code_feature", action="store_true", help="与训练时一致：若缓存包含代码特征则加此开关")
+    parser.add_argument("--code_model_path", type=str, default=None, help="与训练时一致：代码特征的模型路径")
+    parser.add_argument("--code_pooling", type=str, default="last_token", choices=["last_token", "mean"], help="与训练时一致：代码特征 pooling 方式")
+    parser.add_argument("--code_max_length", type=int, default=1024, help="与训练时一致：代码特征最大 token 长度")
+    parser.add_argument("--code_normalize", action="store_true", help="与训练时一致：代码嵌入是否做 L2 归一化")
+    parser.add_argument("--code_cache_root", type=str, default=None, help="代码嵌入缓存根目录（可选）")
+    parser.add_argument("--code_batch_size", type=int, default=8, help="代码特征缓存批大小")
     parser.add_argument("--allow_rebuild", action="store_true", help="若缓存缺失则重新构建（耗时，默认不允许）")
     parser.add_argument("--limit", type=int, default=None, help="仅统计前 N 个配对，调试用")
     parser.add_argument("--target_metric", choices=[spec[0] for spec in METRIC_SPECS], default=None, help="可选，仅输出指定指标")
@@ -217,6 +239,13 @@ def main() -> None:
         cache_root=args.cache_root,
         hierarchical=args.hierarchical,
         region=args.region,
+        use_code_feature=args.use_code_feature,
+        code_model_path=args.code_model_path,
+        code_pooling=args.code_pooling,
+        code_max_length=args.code_max_length,
+        code_normalize=args.code_normalize,
+        code_cache_root=args.code_cache_root,
+        code_batch_size=args.code_batch_size,
         allow_rebuild=args.allow_rebuild,
         limit=args.limit,
     )
@@ -234,6 +263,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
