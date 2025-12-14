@@ -66,3 +66,9 @@ For each layer index `i` in `0 … num_layers-1`:
 - In direct mode, the design head output is returned as the prediction.
 
 All linear layers are initialized with Xavier-uniform weights and zero biases.
+
+## 注意事项：配对生成中断恢复
+- 生成 kernel-design 配对时如果被信号/手动中断，已写入的 `graph_cache/<cache_key>/pairs/*.pt` 会保留，索引缺失时会在下次启动自动重建。
+- 再次运行同样的训练脚本（相同 kernel/design 路径与参数，不带 `--rebuild_cache`）会跳过已有配对，继续构建剩余部分；待全部任务完成后直接进入训练。
+- 如果想强制全量重建缓存，才使用 `--rebuild_cache`，否则会浪费时间和 IO。
+- 已知现象：大数据集（500 designs）配对在 ~10583 处偶发收到 SIGTERM（原因未明，可能由外部调度/限制触发）。此时已完成的配对和缓存会保留，直接重跑同样命令即可续跑，最终仍能完成构建与训练。

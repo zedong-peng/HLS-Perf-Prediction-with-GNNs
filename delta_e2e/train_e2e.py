@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data, DataLoader, Batch
 from torch_geometric.nn import GCNConv, global_mean_pool, global_add_pool, PNAConv
-from torch_geometric.nn import RGCNConv, FastRGCNConv, BatchNorm, GINConv
+from torch_geometric.nn import RGCNConv, FastRGCNConv, GINConv, GraphNorm
 from torch_geometric.utils import degree
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -383,11 +383,7 @@ class E2EDifferentialProcessor:
     
     def collect_all_data(self, limit: Optional[int] = None, materialize: bool = True) -> List[Dict]:
         """收集所有kernel-design配对数据（全局任务并发）"""
-        # 检查是否存在缓存的配对数据
-        if (not self.rebuild_cache) and os.path.exists(self.index_path):
-            log_status(f"[Step3] 检测到缓存索引，直接加载配对数据: {self.index_path}")
-            return self._load_cached_pairs(limit=limit, materialize=materialize)
-
+        # 检查是否存在已完成的缓存数据（仅在进度标记为 complete 时直接加载）
         cache_file = os.path.join(self.graph_cache_dir, "paired_graphs.json")
         if (not self.rebuild_cache) and os.path.exists(cache_file):
             # 兼容旧格式：加载一次后转换为流式缓存
@@ -401,7 +397,6 @@ class E2EDifferentialProcessor:
             log_status("[Step3] 旧版缓存转换完成，重新加载新索引")
             return self._load_cached_pairs(limit=limit, materialize=materialize)
 
-        pairs: List[Dict] = []
         kernel_base = Path(self.kernel_base_dir)
         design_base = Path(self.design_base_dir)
         
@@ -413,8 +408,8 @@ class E2EDifferentialProcessor:
             print(f"错误: Design路径不存在: {design_base}")
             return pairs
         
-        # 先扫描，构建 (kernel_data, design_dir, source_name, algo_name, design_id) 全局任务列表
-        tasks: List[Tuple[Dict, Path, str, str, str]] = []
+        # 先扫描，构建 (kernel_data, design_dir, source_name, algo_name, design_id, pair_id) 全局任务列表
+        tasks: List[Tuple[Dict, Path, str, str, str, str]] = []
         
         log_status(f"[Step3.1] 开始扫描设计目录，准备构建图缓存: {design_base}")
         for source_dir in tqdm(list(design_base.iterdir()), desc="扫描数据源"):
@@ -444,14 +439,60 @@ class E2EDifferentialProcessor:
                 
                 for design_dir in design_dirs:
                     design_id = design_dir.name
-                    tasks.append((kernel_data, design_dir, source_name, algo_name, design_id))
+                    pair_id = f"{source_name}_{algo_name}_{design_id}"
+                    tasks.append((kernel_data, design_dir, source_name, algo_name, design_id, pair_id))
             print("end scanning source_dir: ", source_dir)
         
         if not tasks:
             # 无任务
-            return pairs
-        log_status(f"[Step3.1] 扫描完成，发现 {len(tasks)} 个kernel-design任务，开始构建图缓存与配对")
-        
+            return []
+        total_tasks = len(tasks)
+        log_status(f"[Step3.1] 扫描完成，发现 {total_tasks} 个kernel-design任务，开始构建图缓存与配对")
+
+        # 构建/恢复状态
+        if self.rebuild_cache:
+            self._reset_pair_cache(clear_pairs=True, clear_index=True)
+            existing_pair_files = 0
+        else:
+            Path(self.pairs_dir).mkdir(parents=True, exist_ok=True)
+            try:
+                pair_files_count = len(list(Path(self.pairs_dir).glob("*.pt")))
+            except Exception:
+                pair_files_count = 0
+            index_entries = self._count_index_entries()
+            # 如果索引缺失或条目数小于已有pair文件数，则重建索引
+            if pair_files_count > 0 and index_entries < pair_files_count:
+                self._reset_pair_cache(clear_pairs=False, clear_index=True)
+                index_entries = self._rebuild_index_from_pairs()
+            existing_pair_files = pair_files_count
+
+        processed_pairs = max(
+            existing_pair_files if not self.rebuild_cache else 0,
+            self._count_index_entries()
+        )
+
+        # 如果索引条目数已覆盖全部任务，直接加载缓存
+        if (not self.rebuild_cache) and processed_pairs >= total_tasks and os.path.exists(self.index_path):
+            log_status(f"[Step3] 检测到完整缓存索引（{processed_pairs}/{total_tasks}），直接加载: {self.index_path}")
+            return self._load_cached_pairs(limit=limit, materialize=materialize)
+
+        # 过滤已存在的配对，减少重复计算；仅在 rebuild_cache=False 时生效
+        if not self.rebuild_cache:
+            filtered_tasks = []
+            for task in tasks:
+                _, _, _, _, _, pair_id = task
+                pair_file = Path(self.pairs_dir) / f"{pair_id}.pt"
+                if pair_file.exists():
+                    continue
+                filtered_tasks.append(task)
+            tasks = filtered_tasks
+            remaining = len(tasks)
+            log_status(f"[Step3.1] 发现已有缓存 {processed_pairs} 条，剩余 {remaining} 条需要生成")
+
+        if not tasks and processed_pairs > 0:
+            log_status(f"[Step3.1] 发现 {processed_pairs} 个已有配对，且无新任务，直接加载缓存")
+            return self._load_cached_pairs(limit=limit, materialize=materialize)
+
         # 预先编码设计源码，避免在并行过程中重复加载模型
         if self.use_code_feature:
             design_paths_for_code = [t[1] for t in tasks]
@@ -459,6 +500,7 @@ class E2EDifferentialProcessor:
             self._precompute_design_code_embeddings(design_paths_for_code)
 
         def _run_with_executor(executor_cls):
+            nonlocal processed_pairs
             log_status(f"[Step3.4] 并行处理 {len(tasks)} 个任务构建缓存，max_workers={self.max_workers}")
             extra_kwargs = {}
             # 当系统有 CUDA 或已加载大模型时，使用 spawn 上下文避免 fork 后 CUDA 复用报错
@@ -467,18 +509,22 @@ class E2EDifferentialProcessor:
                     extra_kwargs["mp_context"] = mp.get_context("spawn")
                 except Exception:
                     pass
-            with executor_cls(max_workers=self.max_workers, **extra_kwargs) as executor:
+            index_mode = 'a' if os.path.exists(self.index_path) else 'w'
+            with executor_cls(max_workers=self.max_workers, **extra_kwargs) as executor, \
+                    open(self.index_path, index_mode, encoding='utf-8') as index_f:
                 future_to_task = {executor.submit(self._process_task, task): task for task in tasks}
-                
-                # 使用tqdm显示进度，包含成功/失败统计
-                with tqdm(total=len(tasks), desc="生成配对", ncols=100, 
-                         bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
+
+                # 使用tqdm显示进度，包含成功/失败统计；分批落盘/记录进度
+                with tqdm(total=len(tasks), desc="生成配对", ncols=100,
+                          bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
                     success_count = 0
                     for future in as_completed(future_to_task):
                         result = future.result()
                         if result:
-                            pairs.append(result)
+                            self._write_pair_record(result, index_f)
+                            processed_pairs += 1
                             success_count += 1
+                            index_f.flush()
                         pbar.update(1)
                         pbar.set_postfix({'成功': success_count, '失败': pbar.n - success_count})
 
@@ -486,24 +532,21 @@ class E2EDifferentialProcessor:
             _run_with_executor(ProcessPoolExecutor)
         except Exception as exc:
             print(f"进程池并行构建缓存失败，改用线程池: {exc}")
-            pairs.clear()
+            # 清理部分写入的索引（保留已算好的 pair 文件）
+            self._reset_pair_cache(clear_pairs=False, clear_index=True)
+            processed_pairs = 0
             _run_with_executor(ThreadPoolExecutor)
         
-        # 缓存配对数据
-        if pairs:
-            self._save_cached_pairs(pairs)
-            log_status(f"[Step3.5] 图缓存与配对完成，共生成 {len(pairs)} 条记录，已写入缓存目录 {self.graph_cache_dir}")
+        # 完成后确保索引落盘并返回缓存中的配对
+        if processed_pairs > 0 and os.path.exists(self.index_path):
+            log_status(f"[Step3.5] 图缓存与配对完成，共生成 {processed_pairs} 条记录，已写入缓存目录 {self.graph_cache_dir}")
+            return self._load_cached_pairs(limit=limit, materialize=materialize)
 
-        if materialize:
-            if limit is not None and len(pairs) > limit:
-                return pairs[:limit]
-            return pairs
+        return []
 
-        return self._load_cached_pairs(limit=limit, materialize=False)
-
-    def _process_task(self, task: Tuple[Dict, Path, str, str, str]) -> Optional[Dict]:
+    def _process_task(self, task: Tuple[Dict, Path, str, str, str, str]) -> Optional[Dict]:
         """单个kernel-design配对的处理任务（供并行执行使用）"""
-        kernel_data, design_dir, source_name, algo_name, design_id = task
+        kernel_data, design_dir, source_name, algo_name, design_id, _ = task
         try:
             design_data = self._collect_design_data(design_dir, source_name, algo_name, design_id)
             if design_data:
@@ -673,6 +716,15 @@ class E2EDifferentialProcessor:
                     
                     edge_attr = G.edges[edge] if edge in G.edges else {}
                     edge_feat = edge_to_feature_vector(edge_attr)
+                    # 扩展边特征：保留原索引，并为 edge_type 添加 one-hot 以避免伪序关系
+                    if isinstance(edge_feat, (list, tuple)) and len(edge_feat) >= 2:
+                        edge_type_idx = int(edge_feat[0])
+                        back_idx = int(edge_feat[1])
+                        num_edge_types = get_edge_feature_dims()[0]
+                        edge_type_idx = max(0, min(num_edge_types - 1, edge_type_idx))
+                        one_hot_edge_type = [0] * num_edge_types
+                        one_hot_edge_type[edge_type_idx] = 1
+                        edge_feat = [edge_type_idx, back_idx] + one_hot_edge_type
                     edge_features.append(edge_feat)
             
             if len(edge_index) == 0:
@@ -839,58 +891,121 @@ class E2EDifferentialProcessor:
         except Exception as e:
             print(f"创建配对失败: {e}")
             return None
+
+    def _reset_pair_cache(self, clear_pairs: bool = False, clear_index: bool = True):
+        """清理配对缓存目录与索引。
+        clear_pairs=True 时删除已有 pair 文件；clear_index 控制是否移除索引。
+        """
+        try:
+            Path(self.pairs_dir).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        if clear_pairs:
+            try:
+                for existing in Path(self.pairs_dir).glob("*.pt"):
+                    existing.unlink()
+            except Exception:
+                pass
+        if clear_index:
+            for path in (self.index_path, f"{self.index_path}.tmp"):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception:
+                    pass
+
+    def _write_pair_record(self, pair: Dict, index_f):
+        """将单个配对写入缓存与索引（流式落盘）。"""
+        # 确保图数据在 CPU 上存储
+        kernel_graph = pair['kernel_graph'].to('cpu')
+        design_graph = pair['design_graph'].to('cpu')
+        design_code_embedding = None
+        if pair.get('design_code_embedding') is not None:
+            try:
+                design_code_embedding = pair['design_code_embedding'].detach().cpu()
+            except Exception:
+                design_code_embedding = pair['design_code_embedding']
+
+        payload = {
+            'pair_id': pair['pair_id'],
+            'kernel_graph': kernel_graph,
+            'design_graph': design_graph,
+            'performance_delta': pair['performance_delta'],
+            'pragma_info': pair['pragma_info'],
+            'design_code_embedding': design_code_embedding,
+            'code_hash': pair.get('code_hash'),
+            'kernel_info': {k: v for k, v in pair['kernel_info'].items() if k != 'graph'},
+            'design_info': {k: v for k, v in pair['design_info'].items() if k not in ('graph', 'design_code_embedding')}
+        }
+        is_valid = self._is_pair_payload_valid(payload)
+
+        pair_file = f"pairs/{pair['pair_id']}.pt"
+        torch.save(payload, os.path.join(self.graph_cache_dir, pair_file))
+
+        meta = {
+            'pair_id': pair['pair_id'],
+            'file': pair_file,
+            'design_base_path': payload['design_info'].get('base_path'),
+            'kernel_base_path': payload['kernel_info'].get('base_path'),
+            'pragma_count': int(payload['pragma_info'].get('pragma_count', 0)),
+            'design_num_nodes': int(design_graph.num_nodes),
+            'kernel_num_nodes': int(kernel_graph.num_nodes),
+            'has_code': bool(design_code_embedding is not None),
+            'code_hash': payload.get('code_hash'),
+            'is_valid': bool(is_valid)
+        }
+        index_f.write(json.dumps(meta, ensure_ascii=False) + "\n")
+
+    def _rebuild_index_from_pairs(self):
+        """在索引缺失但已有 pair 文件时，重建索引文件。"""
+        if not os.path.isdir(self.pairs_dir):
+            return 0
+        pair_files = sorted(Path(self.pairs_dir).glob("*.pt"))
+        if not pair_files:
+            return 0
+        tmp_index = self.index_path + ".rebuild"
+        rebuilt = 0
+        with open(tmp_index, 'w', encoding='utf-8') as index_f:
+            for pf in tqdm(pair_files, desc="重建索引", ncols=80):
+                try:
+                    payload = torch.load(pf, map_location='cpu')
+                    if not self._is_pair_payload_valid(payload):
+                        continue
+                    pair = {
+                        'pair_id': payload['pair_id'],
+                        'kernel_graph': payload['kernel_graph'],
+                        'design_graph': payload['design_graph'],
+                        'performance_delta': payload['performance_delta'],
+                        'pragma_info': payload['pragma_info'],
+                        'design_code_embedding': payload.get('design_code_embedding'),
+                        'code_hash': payload.get('code_hash'),
+                        'kernel_info': payload['kernel_info'],
+                        'design_info': payload['design_info']
+                    }
+                    self._write_pair_record(pair, index_f)
+                    rebuilt += 1
+                except Exception:
+                    continue
+        os.replace(tmp_index, self.index_path)
+        return rebuilt
+
+    def _count_index_entries(self) -> int:
+        if not os.path.exists(self.index_path):
+            return 0
+        try:
+            with open(self.index_path, 'r') as f:
+                return sum(1 for line in f if line.strip())
+        except Exception:
+            return 0
     
     def _save_cached_pairs(self, pairs: List[Dict]):
         """保存配对数据到缓存"""
-        # 清理旧缓存文件，避免陈旧数据残留
-        try:
-            for existing in Path(self.pairs_dir).glob("*.pt"):
-                existing.unlink()
-        except Exception:
-            pass
+        self._reset_pair_cache()
 
         tmp_index_path = self.index_path + ".tmp"
         with open(tmp_index_path, 'w', encoding='utf-8') as index_f:
             for pair in tqdm(pairs, desc="缓存图数据"):
-                # 确保图数据在 CPU 上存储
-                kernel_graph = pair['kernel_graph'].to('cpu')
-                design_graph = pair['design_graph'].to('cpu')
-                design_code_embedding = None
-                if pair.get('design_code_embedding') is not None:
-                    try:
-                        design_code_embedding = pair['design_code_embedding'].detach().cpu()
-                    except Exception:
-                        design_code_embedding = pair['design_code_embedding']
-
-                payload = {
-                    'pair_id': pair['pair_id'],
-                    'kernel_graph': kernel_graph,
-                    'design_graph': design_graph,
-                    'performance_delta': pair['performance_delta'],
-                    'pragma_info': pair['pragma_info'],
-                    'design_code_embedding': design_code_embedding,
-                    'code_hash': pair.get('code_hash'),
-                    'kernel_info': {k: v for k, v in pair['kernel_info'].items() if k != 'graph'},
-                    'design_info': {k: v for k, v in pair['design_info'].items() if k not in ('graph', 'design_code_embedding')}
-                }
-                is_valid = self._is_pair_payload_valid(payload)
-
-                pair_file = f"pairs/{pair['pair_id']}.pt"
-                torch.save(payload, os.path.join(self.graph_cache_dir, pair_file))
-
-                meta = {
-                    'pair_id': pair['pair_id'],
-                    'file': pair_file,
-                    'design_base_path': payload['design_info'].get('base_path'),
-                    'kernel_base_path': payload['kernel_info'].get('base_path'),
-                    'pragma_count': int(payload['pragma_info'].get('pragma_count', 0)),
-                    'design_num_nodes': int(design_graph.num_nodes),
-                    'kernel_num_nodes': int(kernel_graph.num_nodes),
-                    'has_code': bool(design_code_embedding is not None),
-                    'code_hash': payload.get('code_hash'),
-                    'is_valid': bool(is_valid)
-                }
-                index_f.write(json.dumps(meta, ensure_ascii=False) + "\n")
+                self._write_pair_record(pair, index_f)
 
         os.replace(tmp_index_path, self.index_path)
 
@@ -1045,12 +1160,17 @@ class SimpleDifferentialGNN(nn.Module):
         if self.use_code_feature and (self.code_dim is None or self.code_dim <= 0):
             raise ValueError("use_code_feature=True 需要提供有效的 code_dim")
 
-        # 节点编码器
-        self.node_encoder = nn.Linear(node_dim, hidden_dim)
+        # 节点编码器（对部分离散字段 one-hot 展开后投影）
+        self.node_feature_dims = get_node_feature_dims()
+        self.one_hot_node_fields = {0, 2, 3}  # 节点特征向量中的第0/2/3列：node_category、opcode_category、possible_opcode_list
+        expanded_node_dim = node_dim - len(self.one_hot_node_fields)
+        for idx in self.one_hot_node_fields:
+            expanded_node_dim += self.node_feature_dims[idx]
+        self.node_encoder = nn.Linear(expanded_node_dim, hidden_dim)
         
         # GNN层 - 支持多种架构
         self.convs = nn.ModuleList()
-        self.batch_norms = nn.ModuleList()
+        self.graph_norms = nn.ModuleList()
         self.edge_encoder: Optional[nn.Module] = None
         pna_deg_tensor: Optional[torch.Tensor] = None
         if self.gnn_type == 'pna':
@@ -1105,26 +1225,24 @@ class SimpleDifferentialGNN(nn.Module):
             else:
                 raise ValueError(f"不支持的GNN类型: {self.gnn_type}. 支持的类型: gcn, gin, rgcn, fast_rgcn, pna")
             
-            # 为所有GNN类型添加归一化层（使用LayerNorm以避免单样本BatchNorm错误）
-            from torch_geometric.nn import LayerNorm
-            self.batch_norms.append(LayerNorm(hidden_dim))
+            # 为所有GNN类型添加归一化层（GraphNorm 对小 batch/单图更稳）
+            self.graph_norms.append(GraphNorm(hidden_dim))
         
         # 代码模态投影
         self.code_proj: Optional[nn.Module] = None
+        self.code_norm: Optional[nn.Module] = None
+        self.code_feature_dim = 0
         if self.use_code_feature:
-            self.code_proj = nn.Sequential(
-                nn.LayerNorm(self.code_dim),
-                nn.Linear(self.code_dim, hidden_dim)
-            )
+            # Layernorm后拼接原始 code 向量
+            self.code_feature_dim = self.code_dim
+            self.code_norm = nn.LayerNorm(self.code_dim)
         
         def _make_head(input_dim: int) -> nn.Sequential:
             return nn.Sequential(
                 nn.Linear(input_dim, hidden_dim),
-                nn.ReLU(),
+                nn.GELU(),
                 nn.Dropout(dropout),
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.ReLU(),
-                nn.Linear(hidden_dim // 2, 1)
+                nn.Linear(hidden_dim, 1)
             )
 
         if self.differential:
@@ -1136,12 +1254,11 @@ class SimpleDifferentialGNN(nn.Module):
             # delta 头融合多种交互项
             delta_input_dim = hidden_dim * 2
             if self.use_code_feature:
-                delta_input_dim += hidden_dim  # 设计代码模态
-            self.delta_input_norm = nn.LayerNorm(delta_input_dim)
+                delta_input_dim += self.code_feature_dim  # 设计代码模态
             self.delta_head = _make_head(delta_input_dim)
         else:
             # 直接预测头
-            design_input_dim = hidden_dim + (hidden_dim if self.use_code_feature else 0)
+            design_input_dim = hidden_dim + (self.code_feature_dim if self.use_code_feature else 0)
             self.design_head = _make_head(design_input_dim)
 
         # 指标索引映射
@@ -1160,7 +1277,9 @@ class SimpleDifferentialGNN(nn.Module):
     
     def encode_graph(self, data):
         """编码图 - 支持多种GNN架构"""
-        x = self.node_encoder(data.x.float())
+        x = self._expand_node_features(data.x)
+        x = self.node_encoder(x)
+        batch_vec = data.batch if hasattr(data, 'batch') else torch.zeros(data.x.size(0), dtype=torch.long, device=data.x.device)
         
         for i, conv in enumerate(self.convs):
             if self.gnn_type == 'gcn':
@@ -1189,15 +1308,27 @@ class SimpleDifferentialGNN(nn.Module):
             else:
                 raise ValueError(f"不支持的GNN类型: {self.gnn_type}")
             
-            # 应用BatchNorm和激活函数
-            x = self.batch_norms[i](x)
+            # GraphNorm 再接 ReLU（最后一层仅归一化）
+            x = self.graph_norms[i](x, batch=batch_vec)
             if i < len(self.convs) - 1:  # 最后一层不用ReLU
                 x = F.relu(x)
         
         # 图级别池化
-        batch = data.batch if hasattr(data, 'batch') else torch.zeros(data.x.size(0), dtype=torch.long, device=data.x.device)
         # 改为 sum 池化以更贴近资源求和语义
-        return global_add_pool(x, batch)
+        return global_add_pool(x, batch_vec)
+
+    def _expand_node_features(self, x: torch.Tensor) -> torch.Tensor:
+        """将指定字段 one-hot 展开，其余字段保持原始数值。"""
+        parts: List[torch.Tensor] = []
+        for idx in range(x.size(1)):
+            col = x[:, idx].long()
+            if idx in self.one_hot_node_fields:
+                num_classes = self.node_feature_dims[idx]
+                col = col.clamp(min=0, max=num_classes - 1)
+                parts.append(F.one_hot(col, num_classes=num_classes).float())
+            else:
+                parts.append(col.float().unsqueeze(-1))
+        return torch.cat(parts, dim=-1)
     
     def forward(self, kernel_graph, design_graph, pragma_count, design_code: Optional[torch.Tensor] = None):
         """前向传播 - 支持差分和直接预测两种模式"""
@@ -1207,7 +1338,7 @@ class SimpleDifferentialGNN(nn.Module):
         if self.use_code_feature:
             if design_code is None:
                 raise ValueError("use_code_feature=True 时需要提供 design_code")
-            code_repr = self.code_proj(design_code.float()) if self.code_proj is not None else design_code.float()
+            code_repr = self.code_norm(design_code.float()) if self.code_norm is not None else design_code.float()
 
         if self.differential:
             # 差分模式：先预测 kernel，再预测 delta
@@ -1224,8 +1355,6 @@ class SimpleDifferentialGNN(nn.Module):
             if code_repr is not None:
                 delta_parts.append(code_repr)
             delta_input = torch.cat(delta_parts, dim=-1)
-            delta_input = self.delta_input_norm(delta_input) # add layer norm to delta input, avoid gradient explosion in DSP training.
-
             delta_pred = self.delta_head(delta_input)
 
             design_pred = kernel_pred + delta_pred
@@ -1450,13 +1579,13 @@ def train_epoch(model, device, train_loader, optimizer, loss_fn=None, grad_accum
             return tensor
         
         if model.differential:
-            design_pred = predictions['design_pred'].squeeze()
-            delta_pred = predictions['delta_pred'].squeeze()
-            kernel_pred = predictions['kernel_pred'].squeeze()
+            design_pred = predictions['design_pred'].view(-1)
+            delta_pred = predictions['delta_pred'].view(-1)
+            kernel_pred = predictions['kernel_pred'].view(-1)
 
-            target_design = targets['design_perf'].squeeze()
-            target_delta = targets['performance_delta'].squeeze()
-            target_kernel = targets['kernel_perf'].squeeze()
+            target_design = targets['design_perf'].view(-1)
+            target_delta = targets['performance_delta'].view(-1)
+            target_kernel = targets['kernel_perf'].view(-1)
 
             design_loss = loss_fn(_norm(design_pred, 'design'), _norm(target_design, 'design'))
             delta_loss = loss_fn(_norm(delta_pred, 'delta'), _norm(target_delta, 'delta'))
@@ -1464,8 +1593,8 @@ def train_epoch(model, device, train_loader, optimizer, loss_fn=None, grad_accum
 
             loss = kernel_loss + delta_loss + 0.2 * design_loss
         else:
-            design_pred = predictions['direct_pred'].squeeze()
-            target_design = targets['design_perf'].squeeze()
+            design_pred = predictions['direct_pred'].view(-1)
+            target_design = targets['design_perf'].view(-1)
             loss = loss_fn(_norm(design_pred, 'design'), _norm(target_design, 'design'))
         
         # 梯度累积缩放
@@ -1531,21 +1660,21 @@ def evaluate_model(model, data_loader, device, target_metric='dsp', return_predi
 
             if model.differential:
                 # 差分模式：预测 kernel、delta，并组合成设计指标
-                design_pred = predictions['design_pred'].squeeze()
-                delta_pred = predictions['delta_pred'].squeeze()
-                kernel_pred = predictions['kernel_pred'].squeeze()
+                design_pred = predictions['design_pred'].view(-1)
+                delta_pred = predictions['delta_pred'].view(-1)
+                kernel_pred = predictions['kernel_pred'].view(-1)
 
-                target_design = targets['design_perf'].squeeze()
-                delta_true = targets['performance_delta'].squeeze()
-                kernel_true = targets['kernel_perf'].squeeze()
+                target_design = targets['design_perf'].view(-1)
+                delta_true = targets['performance_delta'].view(-1)
+                kernel_true = targets['kernel_perf'].view(-1)
 
                 design_loss = loss_fn(_norm(design_pred, 'design'), _norm(target_design, 'design'))
                 delta_loss = loss_fn(_norm(delta_pred, 'delta'), _norm(delta_true, 'delta'))
                 kernel_loss = loss_fn(_norm(kernel_pred, 'kernel'), _norm(kernel_true, 'kernel'))
                 total_batch_loss = kernel_loss + delta_loss + 0.2 * design_loss
             else:
-                design_pred = predictions['direct_pred'].squeeze()
-                target_design = targets['design_perf'].squeeze()
+                design_pred = predictions['direct_pred'].view(-1)
+                target_design = targets['design_perf'].view(-1)
                 delta_pred = None
                 delta_true = None
                 kernel_pred = None
@@ -1755,9 +1884,9 @@ def main():
                         choices=['mae', 'mse', 'smoothl1'],
                         help='训练与评估时使用的损失函数')
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='梯度累积步数（>1 可提高有效批大小）')
-    parser.add_argument('--loader_workers', type=int, default=8, help='DataLoader worker 数量（>0 启用多进程加载）')
+    parser.add_argument('--loader_workers', type=int, default=0, help='DataLoader worker 数量（>0 启用多进程加载）')
     parser.add_argument('--prefetch_factor', type=int, default=4, help='DataLoader 预取批数（num_workers>0 时有效）')
-    parser.add_argument('--persistent_workers', type=str, default='true', choices=['true', 'false'], help='是否持久化 DataLoader workers')
+    parser.add_argument('--persistent_workers', type=str, default='false', choices=['true', 'false'], help='是否持久化 DataLoader workers')
     parser.add_argument('--loader_start_method', type=str, default='spawn',
                         choices=['spawn', 'fork'],
                         help='DataLoader worker 启动方式（spawn 更安全，fork 更快但可能与 CUDA 线程冲突）')
@@ -1790,7 +1919,7 @@ def main():
                         help='是否使用差分学习模式：true=差分学习(kernel+design)，false=直接预测(仅design)')
     
     # 训练策略参数
-    parser.add_argument('--warmup_epochs', type=int, default=5, help='Linear warmup 的 epoch 数（0 表示关闭）')
+    parser.add_argument('--warmup_epochs', type=int, default=10, help='Linear warmup 的 epoch 数（0 表示关闭）')
     parser.add_argument('--min_lr', type=float, default=1e-5, help='学习率下限（避免过小导致训练停滞）')
     parser.add_argument('--apply_hard_filter', type=str, default='true', choices=['true', 'false'],
                         help='是否过滤无效设计（基于稳健分位 p05-p95）')
@@ -2144,7 +2273,7 @@ def main():
     
     # 优化器和调度器
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=30)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=10)
     
     # 学习率工具函数
     def _set_optimizer_lr(optim_obj, lr_value):

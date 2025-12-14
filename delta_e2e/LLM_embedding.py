@@ -20,7 +20,7 @@ class LLMEmbedder:
         dtype: Optional[torch.dtype] = None,
         max_length: int = 2048,
         pooling: str = "last_token",
-        normalize: bool = True,
+        normalize: bool = False,
     ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.torch_dtype = dtype or (torch.float16 if self.device.startswith("cuda") else torch.float32)
