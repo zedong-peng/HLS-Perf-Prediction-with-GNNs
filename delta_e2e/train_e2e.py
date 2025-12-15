@@ -1141,9 +1141,9 @@ class E2EDifferentialProcessor:
 # ============================================================================
 
 class SimpleDifferentialGNN(nn.Module):
-    """支持多种GNN架构的差值学习模型"""
+    """支持多种GNN架构的差值学习模型；设计与Kernel使用独立GNN参数。"""
     
-    def __init__(self, node_dim: int, hidden_dim: int = 128, num_layers: int = 3, 
+    def __init__(self, node_dim: int, hidden_dim: int = 128, num_layers: int = 2, 
                  dropout: float = 0.1, target_metric: str = 'dsp', differential: bool = True,
                  gnn_type: str = 'gcn', kernel_baseline: str = 'learned',
                  pna_deg: Optional[torch.Tensor] = None, edge_dim: Optional[int] = None,
@@ -1151,6 +1151,7 @@ class SimpleDifferentialGNN(nn.Module):
         super().__init__()
         self.target_metric = target_metric
         self.hidden_dim = hidden_dim
+        self.num_layers = int(num_layers)
         self.differential = differential
         self.gnn_type = gnn_type.lower()
         self.kernel_baseline = kernel_baseline.lower()
@@ -1166,67 +1167,26 @@ class SimpleDifferentialGNN(nn.Module):
         expanded_node_dim = node_dim - len(self.one_hot_node_fields)
         for idx in self.one_hot_node_fields:
             expanded_node_dim += self.node_feature_dims[idx]
-        self.node_encoder = nn.Linear(expanded_node_dim, hidden_dim)
-        
-        # GNN层 - 支持多种架构
-        self.convs = nn.ModuleList()
-        self.graph_norms = nn.ModuleList()
-        self.edge_encoder: Optional[nn.Module] = None
+        self.expanded_node_dim = expanded_node_dim
+
+        # 设计 / Kernel 各自的 GNN 组件
+        self.design_node_encoder: nn.Module
+        self.kernel_node_encoder: nn.Module
+        self.design_convs: nn.ModuleList
+        self.kernel_convs: nn.ModuleList
+        self.design_graph_norms: nn.ModuleList
+        self.kernel_graph_norms: nn.ModuleList
+        self.design_edge_encoder: Optional[nn.Module] = None
+        self.kernel_edge_encoder: Optional[nn.Module] = None
         pna_deg_tensor: Optional[torch.Tensor] = None
         if self.gnn_type == 'pna':
             if pna_deg is None or pna_deg.numel() == 0:
                 raise ValueError("PNA 架构需要提供非空的度直方图 (pna_deg)。")
             pna_deg_tensor = pna_deg.detach().clone().to(torch.long)
-            if self.edge_dim > 0:
-                self.edge_encoder = nn.Linear(self.edge_dim, hidden_dim)
-        
-        for _ in range(num_layers):
-            if self.gnn_type == 'gcn':
-                self.convs.append(GCNConv(hidden_dim, hidden_dim))
-            elif self.gnn_type == 'gin':
-                # GIN需要一个MLP作为参数
-                # 添加LayerNorm以稳定梯度流，避免激活分布偏移
-                # LayerNorm对特征维度归一化，不依赖batch大小，适合图数据
-                # 模式: Linear -> LayerNorm -> ReLU -> Linear
-                # 
-                # 重要经验：如果不加LayerNorm，GIN在DSP任务上loss基本不下降，无法正常学习
-                # 这是因为GIN的MLP缺少归一化导致梯度流不稳定，激活分布偏移
-                mlp = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.LayerNorm(hidden_dim),  # 归一化后激活，稳定第一层的梯度
-                    nn.ReLU(),
-                    nn.Linear(hidden_dim, hidden_dim)
-                    # 最后一层不添加LayerNorm，因为GIN层后还有全局LayerNorm
-                )
-                self.convs.append(GINConv(mlp))
-            elif self.gnn_type == 'rgcn':
-                # RGCN需要边类型数量，使用特征定义中的边类型维度自动获取
-                self.convs.append(RGCNConv(hidden_dim, hidden_dim, num_relations=get_edge_feature_dims()[0], num_bases=30))
-            elif self.gnn_type == 'fast_rgcn':
-                self.convs.append(FastRGCNConv(hidden_dim, hidden_dim, num_relations=get_edge_feature_dims()[0], num_bases=30))
-            elif self.gnn_type == 'pna':
-                aggregators = ['mean', 'min', 'max', 'std']
-                scalers = ['identity', 'amplification', 'attenuation']
-                edge_dim_param = hidden_dim if self.edge_encoder is not None else None
-                self.convs.append(
-                    PNAConv(
-                        in_channels=hidden_dim,
-                        out_channels=hidden_dim,
-                        aggregators=aggregators,
-                        scalers=scalers,
-                        deg=pna_deg_tensor,
-                        edge_dim=edge_dim_param,
-                        towers=1,
-                        pre_layers=1,
-                        post_layers=1,
-                        divide_input=False
-                    )
-                )
-            else:
-                raise ValueError(f"不支持的GNN类型: {self.gnn_type}. 支持的类型: gcn, gin, rgcn, fast_rgcn, pna")
-            
-            # 为所有GNN类型添加归一化层（GraphNorm 对小 batch/单图更稳）
-            self.graph_norms.append(GraphNorm(hidden_dim))
+        (self.design_node_encoder, self.design_convs, self.design_graph_norms, self.design_edge_encoder) = \
+            self._build_gnn_stack(pna_deg_tensor)
+        (self.kernel_node_encoder, self.kernel_convs, self.kernel_graph_norms, self.kernel_edge_encoder) = \
+            self._build_gnn_stack(pna_deg_tensor)
         
         # 代码模态投影
         self.code_proj: Optional[nn.Module] = None
@@ -1267,6 +1227,55 @@ class SimpleDifferentialGNN(nn.Module):
         # 权重初始化
         self._init_weights()
     
+    def _build_gnn_stack(self, pna_deg_tensor: Optional[torch.Tensor]):
+        """构建单侧（design/kernel）的GNN组件，结构一致但参数独立。"""
+        node_encoder = nn.Linear(self.expanded_node_dim, self.hidden_dim)
+        convs = nn.ModuleList()
+        graph_norms = nn.ModuleList()
+        edge_encoder: Optional[nn.Module] = None
+        if self.gnn_type == 'pna' and self.edge_dim > 0:
+            edge_encoder = nn.Linear(self.edge_dim, self.hidden_dim)
+
+        for _ in range(self.num_layers):
+            if self.gnn_type == 'gcn':
+                convs.append(GCNConv(self.hidden_dim, self.hidden_dim))
+            elif self.gnn_type == 'gin':
+                mlp = nn.Sequential(
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                    nn.LayerNorm(self.hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(self.hidden_dim, self.hidden_dim)
+                )
+                convs.append(GINConv(mlp))
+            elif self.gnn_type == 'rgcn':
+                convs.append(RGCNConv(self.hidden_dim, self.hidden_dim, num_relations=get_edge_feature_dims()[0], num_bases=30))
+            elif self.gnn_type == 'fast_rgcn':
+                convs.append(FastRGCNConv(self.hidden_dim, self.hidden_dim, num_relations=get_edge_feature_dims()[0], num_bases=30))
+            elif self.gnn_type == 'pna':
+                aggregators = ['mean', 'min', 'max', 'std']
+                scalers = ['identity', 'amplification', 'attenuation']
+                edge_dim_param = self.hidden_dim if edge_encoder is not None else None
+                convs.append(
+                    PNAConv(
+                        in_channels=self.hidden_dim,
+                        out_channels=self.hidden_dim,
+                        aggregators=aggregators,
+                        scalers=scalers,
+                        deg=pna_deg_tensor,
+                        edge_dim=edge_dim_param,
+                        towers=1,
+                        pre_layers=1,
+                        post_layers=1,
+                        divide_input=False
+                    )
+                )
+            else:
+                raise ValueError(f"不支持的GNN类型: {self.gnn_type}. 支持的类型: gcn, gin, rgcn, fast_rgcn, pna")
+
+            graph_norms.append(GraphNorm(self.hidden_dim))
+
+        return node_encoder, convs, graph_norms, edge_encoder
+    
     def _init_weights(self):
         """初始化权重"""
         for m in self.modules():
@@ -1275,20 +1284,25 @@ class SimpleDifferentialGNN(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
     
-    def encode_graph(self, data):
+    def encode_graph(self, data, branch: str):
         """编码图 - 支持多种GNN架构"""
+        if branch not in ('design', 'kernel'):
+            raise ValueError(f"branch 应为 design 或 kernel，收到 {branch}")
+        node_encoder = self.design_node_encoder if branch == 'design' else self.kernel_node_encoder
+        convs = self.design_convs if branch == 'design' else self.kernel_convs
+        graph_norms = self.design_graph_norms if branch == 'design' else self.kernel_graph_norms
+        edge_encoder = self.design_edge_encoder if branch == 'design' else self.kernel_edge_encoder
+
         x = self._expand_node_features(data.x)
-        x = self.node_encoder(x)
+        x = node_encoder(x)
         batch_vec = data.batch if hasattr(data, 'batch') else torch.zeros(data.x.size(0), dtype=torch.long, device=data.x.device)
         
-        for i, conv in enumerate(self.convs):
+        for i, conv in enumerate(convs):
             if self.gnn_type == 'gcn':
                 x = conv(x, data.edge_index)
             elif self.gnn_type == 'gin':
-                # GIN使用标准的消息传递
                 x = conv(x, data.edge_index)
             elif self.gnn_type in ['rgcn', 'fast_rgcn']:
-                # RGCN需要边类型
                 edge_type = data.edge_attr[:, 0].long() if hasattr(data, 'edge_attr') and data.edge_attr is not None else torch.zeros(data.edge_index.size(1), dtype=torch.long, device=data.edge_index.device)
                 x = conv(x, data.edge_index, edge_type)
             elif self.gnn_type == 'pna':
@@ -1303,18 +1317,15 @@ class SimpleDifferentialGNN(nn.Module):
                         dtype=torch.float,
                         device=x.device
                     )
-                edge_features = self.edge_encoder(edge_attr) if (self.edge_encoder is not None and edge_attr is not None) else edge_attr
+                edge_features = edge_encoder(edge_attr) if (edge_encoder is not None and edge_attr is not None) else edge_attr
                 x = conv(x, data.edge_index, edge_features)
             else:
                 raise ValueError(f"不支持的GNN类型: {self.gnn_type}")
             
-            # GraphNorm 再接 ReLU（最后一层仅归一化）
-            x = self.graph_norms[i](x, batch=batch_vec)
-            if i < len(self.convs) - 1:  # 最后一层不用ReLU
+            x = graph_norms[i](x, batch=batch_vec)
+            if i < len(convs) - 1:
                 x = F.relu(x)
         
-        # 图级别池化
-        # 改为 sum 池化以更贴近资源求和语义
         return global_add_pool(x, batch_vec)
 
     def _expand_node_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -1333,7 +1344,7 @@ class SimpleDifferentialGNN(nn.Module):
     def forward(self, kernel_graph, design_graph, pragma_count, design_code: Optional[torch.Tensor] = None):
         """前向传播 - 支持差分和直接预测两种模式"""
         # 编码图
-        design_repr = self.encode_graph(design_graph)
+        design_repr = self.encode_graph(design_graph, branch='design')
         code_repr = None
         if self.use_code_feature:
             if design_code is None:
@@ -1342,7 +1353,7 @@ class SimpleDifferentialGNN(nn.Module):
 
         if self.differential:
             # 差分模式：先预测 kernel，再预测 delta
-            kernel_repr = self.encode_graph(kernel_graph)
+            kernel_repr = self.encode_graph(kernel_graph, branch='kernel')
             if self.kernel_baseline == 'learned':
                 kernel_pred = self.kernel_head(kernel_repr)
             else:
@@ -1591,7 +1602,7 @@ def train_epoch(model, device, train_loader, optimizer, loss_fn=None, grad_accum
             delta_loss = loss_fn(_norm(delta_pred, 'delta'), _norm(target_delta, 'delta'))
             kernel_loss = loss_fn(_norm(kernel_pred, 'kernel'), _norm(target_kernel, 'kernel'))
 
-            loss = kernel_loss + delta_loss + 0.2 * design_loss
+            loss = kernel_loss + delta_loss + design_loss
         else:
             design_pred = predictions['direct_pred'].view(-1)
             target_design = targets['design_perf'].view(-1)
@@ -1671,7 +1682,7 @@ def evaluate_model(model, data_loader, device, target_metric='dsp', return_predi
                 design_loss = loss_fn(_norm(design_pred, 'design'), _norm(target_design, 'design'))
                 delta_loss = loss_fn(_norm(delta_pred, 'delta'), _norm(delta_true, 'delta'))
                 kernel_loss = loss_fn(_norm(kernel_pred, 'kernel'), _norm(kernel_true, 'kernel'))
-                total_batch_loss = kernel_loss + delta_loss + 0.2 * design_loss
+                total_batch_loss = kernel_loss + delta_loss + design_loss
             else:
                 design_pred = predictions['direct_pred'].view(-1)
                 target_design = targets['design_perf'].view(-1)
@@ -1866,7 +1877,7 @@ def main():
                         choices=['dsp', 'lut', 'ff', 'latency'],
                         help='目标预测指标')
     parser.add_argument('--hidden_dim', type=int, default=128, help='隐藏层维度')
-    parser.add_argument('--num_layers', type=int, default=3, help='GNN层数')
+    parser.add_argument('--num_layers', type=int, default=2, help='GNN层数（设计/Kernel各自独立但层数一致）')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout率')
     parser.add_argument('--gnn_type', type=str, default='gcn',
                         choices=['gcn', 'gin', 'rgcn', 'fast_rgcn', 'pna'],
