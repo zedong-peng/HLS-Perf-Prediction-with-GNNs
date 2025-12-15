@@ -17,7 +17,7 @@ trap cleanup SIGINT SIGTERM
 
 
 
-features=("ff" "dsp" "lut")
+features=("dsp" "ff" "lut")
 # exp1: origin GNN
 differentials=("false")
 hierarchical=("off")
@@ -31,9 +31,9 @@ gnn=("pna")
 
 # design_base_dir
 # design_base_dir="/home/user/zedongpeng/workspace/Huggingface/forgehls_lite_100designs"
-design_base_dir="/home/user/zedongpeng/workspace/Huggingface/forgehls_PolyBench_part_250designs"
+# design_base_dir="/home/user/zedongpeng/workspace/Huggingface/forgehls_PolyBench_part_250designs"
 # design_base_dir="/home/user/zedongpeng/workspace/Huggingface/new_polybench_without_attribution_pragma_50designs"
-# design_base_dir="/home/user/zedongpeng/workspace/Huggingface/forgehls_PolyBench_part_500designs"
+design_base_dir="/home/user/zedongpeng/workspace/Huggingface/forgehls_PolyBench_part_500designs"
 
 # 串行运行，减少总内存占用；并配置更保守的内存参数
 # 4090 当前配置下可稳定执行3个训练任务
@@ -51,24 +51,18 @@ for differential in "${differentials[@]}"; do
           --output_dir ./output \
           --cache_root ./graph_cache \
           --gnn_type $gnn_type \
-          --epochs 600 \
-          --batch_size 32 \
+          --epochs 300 \
+          --batch_size 16 \
           --hidden_dim 128 \
           --num_layers 2 \
-          --dropout 0.05 \
-          --lr 1e-3 \
-          --grad_accum_steps 1 \
-          --warmup_epochs 5 \
+          --dropout 0.02 \
+          --lr 5e-4 \
           --target_metric $feature \
           --hierarchical $h \
           --region $r \
           --differential $differential \
           --kernel_baseline learned \
-          --loss_type mae \
-          --loader_workers 0 \
-          --prefetch_factor 1 \
-          --persistent_workers false \
-          --pin_memory false
+          --loss_type smoothl1
         done
       done
     done

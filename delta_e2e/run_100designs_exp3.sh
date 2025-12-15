@@ -18,7 +18,6 @@ trap cleanup SIGINT SIGTERM
 
 
 features=("dsp" "ff" "lut")
-# features=("dsp")
 
 # exp3: delta GNN with code feature
 code_model_path="/home/user/zedongpeng/workspace/GiT/zedong/Code-Verification/Qwen/Qwen2.5-Coder-1.5B-Instruct"
@@ -52,7 +51,7 @@ for feature in "${features[@]}"; do
     --output_dir ./output \
     --cache_root ./graph_cache \
     --gnn_type $gnn_type \
-    --epochs 600 \
+    --epochs 450 \
     --batch_size 16 \
     --hidden_dim 128 \
     --num_layers 2 \

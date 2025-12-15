@@ -435,6 +435,23 @@ def parse_xml_into_graph_single(xml_file: str, hierarchical: bool = False, regio
                 G.nodes[n]['region_ii'] = G.nodes[n].get('region_ii', 0)
                 G.nodes[n]['region_pipe_depth'] = G.nodes[n].get('region_pipe_depth', 0)
 
+        # regions 段 interval/pipe_depth 兜底（部分子 ADB 只在此处提供）
+        interval_fallback = 0
+        pipe_depth_fallback = 0
+        for reg in root.findall('.//regions//item'):
+            try:
+                iv = int(reg.findtext('interval', default='0'))
+            except Exception:
+                iv = 0
+            try:
+                pd = int(reg.findtext('pipe_depth', default='0'))
+            except Exception:
+                pd = 0
+            if iv > 0:
+                interval_fallback = max(interval_fallback, iv)
+            if pd > 0:
+                pipe_depth_fallback = max(pipe_depth_fallback, pd)
+
         # 收集区域以便分层模式创建节点
         region_records = []  # (region_key, is_pipelined, ii, depth, basic_block_ids)
 
@@ -452,7 +469,9 @@ def parse_xml_into_graph_single(xml_file: str, hierarchical: bool = False, regio
                 mIsDfPipe = int(reg.findtext('mIsDfPipe', default='0'))
             except Exception:
                 mIsDfPipe = 0
-            is_pipelined = 1 if ((mII is not None and mII > 0) or (mDepth is not None and mDepth > 0) or (mIsDfPipe == 1)) else 0
+            effective_ii = mII if (mII is not None and mII > 0) else (interval_fallback if interval_fallback > 0 else 0)
+            effective_depth = mDepth if (mDepth is not None and mDepth > 0) else (pipe_depth_fallback if pipe_depth_fallback > 0 else 0)
+            is_pipelined = 1 if (effective_ii > 0 or effective_depth > 0 or mIsDfPipe == 1) else 0
 
             # 标注到 basic_blocks 的节点上（仅当 region 开启时）
             bb_ids: List[str] = []
@@ -467,12 +486,12 @@ def parse_xml_into_graph_single(xml_file: str, hierarchical: bool = False, regio
                         node_name = prefix + bb_id
                         if node_name in G.nodes():
                             G.nodes[node_name]['region_is_pipelined'] = is_pipelined
-                            G.nodes[node_name]['region_ii'] = max(0, mII if mII is not None and mII > 0 else 0)
-                            G.nodes[node_name]['region_pipe_depth'] = max(0, mDepth if mDepth is not None and mDepth > 0 else 0)
+                            G.nodes[node_name]['region_ii'] = max(0, effective_ii)
+                            G.nodes[node_name]['region_pipe_depth'] = max(0, effective_depth)
 
             # 记录区域信息用于层次化
             region_key = reg.findtext('mTag', default=f'region_{idx}') or f'region_{idx}'
-            region_records.append((region_key, is_pipelined, max(0, mII if mII and mII > 0 else 0), max(0, mDepth if mDepth and mDepth > 0 else 0), bb_ids))
+            region_records.append((region_key, is_pipelined, max(0, effective_ii), max(0, effective_depth), bb_ids))
 
         # 分层模式：增加区域节点与包含关系边（独立于 region 标志）
         if hierarchical and region_records:
