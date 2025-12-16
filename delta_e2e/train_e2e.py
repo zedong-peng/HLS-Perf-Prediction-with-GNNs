@@ -186,12 +186,9 @@ class E2EDifferentialProcessor:
         # 图缓存路径 - 根据kernel/design根目录生成隔离的子目录，避免不同数据源相互污染
         kb = os.path.abspath(self.kernel_base_dir)
         db = os.path.abspath(self.design_base_dir)
-        # 在cache key中加入特征版本，避免特征维度变化导致旧缓存失配
+        # 在cache key中加入特征版本，避免特征维度变化导致旧缓存失配；图缓存不绑定代码特征，便于独立演进
         feature_version = "featv=20250924.0"
-        code_tag = ""
-        if self.use_code_feature:
-            code_tag = f"|code=1|pool={self.code_pooling}|mlen={self.code_max_length}|norm={'1' if self.code_normalize else '0'}|model={self.code_model_path or 'none'}"
-        cache_key_src = f"kb={kb}|db={db}|hier={'1' if self.hierarchical else '0'}|region={'1' if self.region else '0'}|{feature_version}{code_tag}"
+        cache_key_src = f"kb={kb}|db={db}|hier={'1' if self.hierarchical else '0'}|region={'1' if self.region else '0'}|{feature_version}"
         cache_key = hashlib.md5(cache_key_src.encode("utf-8")).hexdigest()[:12]
         self.graph_cache_dir = os.path.join(cache_root, cache_key)
         os.makedirs(self.graph_cache_dir, exist_ok=True)
@@ -210,6 +207,7 @@ class E2EDifferentialProcessor:
                         "hierarchical": self.hierarchical,
                         "region": self.region,
                         "feature_version": feature_version,
+                        "cache_kind": "graph_only",
                         "max_workers": int(self.max_workers),
                         "use_code_feature": self.use_code_feature,
                         "code_model_path": self.code_model_path,
@@ -275,6 +273,16 @@ class E2EDifferentialProcessor:
             cached = torch.load(cache_path, map_location='cpu')
             emb = cached.get('embedding')
             meta = cached.get('meta', {})
+            expected_cfg = {
+                "model_path": self.code_model_path,
+                "pooling": self.code_pooling,
+                "max_length": int(self.code_max_length),
+                "normalize": bool(self.code_normalize)
+            }
+            for key, expected_val in expected_cfg.items():
+                if meta.get(key) != expected_val:
+                    # 配置不一致则视为未命中，触发重算
+                    return None
             code_hash = meta.get('code_hash')
             if emb is not None:
                 return emb, code_hash
@@ -493,12 +501,6 @@ class E2EDifferentialProcessor:
             log_status(f"[Step3.1] 发现 {processed_pairs} 个已有配对，且无新任务，直接加载缓存")
             return self._load_cached_pairs(limit=limit, materialize=materialize)
 
-        # 预先编码设计源码，避免在并行过程中重复加载模型
-        if self.use_code_feature:
-            design_paths_for_code = [t[1] for t in tasks]
-            log_status(f"[Step3.2] 开始预编码设计源码嵌入，共 {len(design_paths_for_code)} 个 design")
-            self._precompute_design_code_embeddings(design_paths_for_code)
-
         def _run_with_executor(executor_cls):
             nonlocal processed_pairs
             log_status(f"[Step3.4] 并行处理 {len(tasks)} 个任务构建缓存，max_workers={self.max_workers}")
@@ -617,11 +619,6 @@ class E2EDifferentialProcessor:
             # 提取pragma信息
             pragma_info = self._extract_pragma_info(design_path)
 
-            design_code_embedding = None
-            code_hash = None
-            if self.use_code_feature:
-                design_code_embedding, code_hash = self._get_design_code_embedding(design_path)
-            
             return {
                 'type': 'design',
                 'source_name': source_name,
@@ -631,8 +628,8 @@ class E2EDifferentialProcessor:
                 'performance': perf_data,
                 'graph': graph_data,
                 'pragma_info': pragma_info,
-                'design_code_embedding': design_code_embedding,
-                'code_hash': code_hash
+                'design_code_embedding': None,
+                'code_hash': None
             }
             
         except Exception as e:
@@ -919,12 +916,6 @@ class E2EDifferentialProcessor:
         # 确保图数据在 CPU 上存储
         kernel_graph = pair['kernel_graph'].to('cpu')
         design_graph = pair['design_graph'].to('cpu')
-        design_code_embedding = None
-        if pair.get('design_code_embedding') is not None:
-            try:
-                design_code_embedding = pair['design_code_embedding'].detach().cpu()
-            except Exception:
-                design_code_embedding = pair['design_code_embedding']
 
         payload = {
             'pair_id': pair['pair_id'],
@@ -932,7 +923,7 @@ class E2EDifferentialProcessor:
             'design_graph': design_graph,
             'performance_delta': pair['performance_delta'],
             'pragma_info': pair['pragma_info'],
-            'design_code_embedding': design_code_embedding,
+            'design_code_embedding': None,  # 代码特征单独缓存，避免与图缓存耦合
             'code_hash': pair.get('code_hash'),
             'kernel_info': {k: v for k, v in pair['kernel_info'].items() if k != 'graph'},
             'design_info': {k: v for k, v in pair['design_info'].items() if k not in ('graph', 'design_code_embedding')}
@@ -950,7 +941,7 @@ class E2EDifferentialProcessor:
             'pragma_count': int(payload['pragma_info'].get('pragma_count', 0)),
             'design_num_nodes': int(design_graph.num_nodes),
             'kernel_num_nodes': int(kernel_graph.num_nodes),
-            'has_code': bool(design_code_embedding is not None),
+            'has_code': bool(self.use_code_feature and payload.get('code_hash')),
             'code_hash': payload.get('code_hash'),
             'is_valid': bool(is_valid)
         }
@@ -1037,6 +1028,43 @@ class E2EDifferentialProcessor:
             return False
         return True
 
+    def _attach_design_code(self, payload: Dict) -> Dict:
+        """为已加载的图样本附加/刷新代码嵌入，避免代码配置变更时重建图缓存。"""
+        payload['design_code_embedding'] = None
+        if not self.use_code_feature:
+            return payload
+        design_base = payload.get('design_info', {}).get('base_path')
+        if not design_base:
+            return payload
+        try:
+            emb, code_hash = self._get_design_code_embedding(Path(design_base))
+            payload['design_code_embedding'] = emb
+            if code_hash:
+                payload['code_hash'] = code_hash
+        except Exception as exc:
+            print(f"附加代码嵌入失败 {design_base}: {exc}")
+        return payload
+
+    def attach_code_features(self, pairs: List[Dict]) -> List[Dict]:
+        """先构建/补全代码缓存，再按顺序为配对添加代码嵌入。"""
+        if not self.use_code_feature:
+            return pairs
+        design_paths = []
+        for pair in pairs:
+            design_base = pair.get('design_info', {}).get('base_path')
+            if design_base:
+                design_paths.append(Path(design_base))
+        # 预编码缺失的设计源码嵌入（不涉及中断续跑逻辑）
+        self._precompute_design_code_embeddings(design_paths)
+        # 按原顺序附加，确保与 graph cache 顺序一致
+        enriched = [self._attach_design_code(pair) for pair in pairs]
+        missing = sum(1 for p in enriched if p.get('design_code_embedding') is None)
+        try:
+            log_status(f"[CodeCache] 对齐完成：总样本 {len(enriched)}，缺少代码嵌入 {missing}")
+        except Exception:
+            pass
+        return enriched
+
     def _load_cached_pairs(self, limit: Optional[int] = None, materialize: bool = True) -> List[Dict]:
         """从缓存加载配对数据（流式）"""
         records: List[Dict] = []
@@ -1048,22 +1076,19 @@ class E2EDifferentialProcessor:
                     if not line.strip():
                         continue
                     entry = json.loads(line)
+                    pair_path = os.path.join(self.graph_cache_dir, entry['file'])
+                    if not os.path.exists(pair_path):
+                        continue
                     if materialize:
-                        pair_path = os.path.join(self.graph_cache_dir, entry['file'])
-                        if not os.path.exists(pair_path):
-                            continue
                         try:
                             payload = torch.load(pair_path, map_location='cpu')
-                            if not self._is_pair_payload_valid(payload):
-                                filtered_out += 1
-                                continue
-                            records.append(payload)
                         except Exception:
                             continue
-                    else:
-                        pair_path = os.path.join(self.graph_cache_dir, entry['file'])
-                        if not os.path.exists(pair_path):
+                        if not self._is_pair_payload_valid(payload):
+                            filtered_out += 1
                             continue
+                        records.append(payload)
+                    else:
                         entry['file'] = pair_path
                         is_valid = entry.get('is_valid')
                         if is_valid is False:
@@ -1128,6 +1153,8 @@ class E2EDifferentialProcessor:
                 if not self._is_pair_payload_valid(pair):
                     continue
 
+                # 旧版缓存不携带代码特征；后续统一通过 attach_code_features 追加
+                pair['design_code_embedding'] = None
                 pairs.append(pair)
 
             except Exception:
@@ -2008,6 +2035,11 @@ def main():
     log_status("[Step3] 开始构建/加载ID图缓存并生成kernel-design配对")
     pairs = processor.collect_all_data()
     log_status(f"[Step3.5] ID 图缓存与配对完成，获得 {len(pairs)} 条记录")
+
+    if use_code_feature:
+        log_status("[Step3.6] 构建/加载代码缓存并与图缓存对齐")
+        pairs = processor.attach_code_features(pairs)
+        log_status(f"[Step3.6] 代码缓存对齐完成，可用样本 {len(pairs)} 条")
     
     if not pairs:
         print("错误: 未找到有效的kernel-design配对")
@@ -2037,6 +2069,10 @@ def main():
         log_status("[Step5] 开始构建/加载OOD图缓存并生成kernel-design配对")
         ood_pairs = ood_processor.collect_all_data()
         log_status(f"[Step5] OOD 图缓存与配对完成，获得 {len(ood_pairs)} 条记录")
+        if use_code_feature and ood_pairs:
+            log_status("[Step5.1] 构建/加载 OOD 代码缓存并与图缓存对齐")
+            ood_pairs = ood_processor.attach_code_features(ood_pairs)
+            log_status(f"[Step5.1] OOD 代码缓存对齐完成，可用样本 {len(ood_pairs)} 条")
     else:
         print(f"提示: OOD 路径不可用或未提供，将跳过 OOD 评估: {args.ood_design_base_dir}")
         log_status("[Step5] 未提供 OOD 路径，跳过 OOD 评估阶段")
@@ -2288,7 +2324,7 @@ def main():
     
     # 优化器和调度器
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=10)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=15)
     
     # 学习率工具函数
     def _set_optimizer_lr(optim_obj, lr_value):
