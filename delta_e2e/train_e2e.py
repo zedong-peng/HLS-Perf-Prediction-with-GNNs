@@ -1190,12 +1190,16 @@ class SimpleDifferentialGNN(nn.Module):
         
         # 代码模态投影
         self.code_proj: Optional[nn.Module] = None
-        self.code_norm: Optional[nn.Module] = None
+        self.code_adapter: Optional[nn.Module] = None
         self.code_feature_dim = 0
         if self.use_code_feature:
-            # Layernorm后拼接原始 code 向量
-            self.code_feature_dim = self.code_dim
-            self.code_norm = nn.LayerNorm(self.code_dim)
+            # 适配 code 向量到隐藏维度后拼接
+            self.code_feature_dim = self.hidden_dim
+            self.code_adapter = nn.Sequential(
+                nn.Linear(self.code_dim, self.hidden_dim),
+                nn.GELU(),
+                nn.Dropout(0.3),
+            )
         
         def _make_head(input_dim: int) -> nn.Sequential:
             return nn.Sequential(
@@ -1349,7 +1353,7 @@ class SimpleDifferentialGNN(nn.Module):
         if self.use_code_feature:
             if design_code is None:
                 raise ValueError("use_code_feature=True 时需要提供 design_code")
-            code_repr = self.code_norm(design_code.float()) if self.code_norm is not None else design_code.float()
+            code_repr = self.code_adapter(design_code.float()) if self.code_adapter is not None else design_code.float()
 
         if self.differential:
             # 差分模式：先预测 kernel，再预测 delta
@@ -1917,8 +1921,8 @@ def main():
     parser.add_argument('--code_model_path', type=str, default=None, help='LLM 模型路径（启用代码特征时必填）')
     parser.add_argument('--code_cache_root', type=str, default=default_cache_root, help='代码嵌入缓存根目录')
     parser.add_argument('--code_pooling', type=str, default='last_token', choices=['last_token', 'mean'], help='代码嵌入的 pooling 策略')
-    parser.add_argument('--code_max_length', type=int, default=1024, help='代码嵌入的最大 token 长度')
-    parser.add_argument('--code_normalize', type=str, default='true', choices=['true', 'false'], help='是否对代码嵌入做 L2 归一化')
+    parser.add_argument('--code_max_length', type=int, default=2048, help='代码嵌入的最大 token 长度')
+    parser.add_argument('--code_normalize', type=str, default='false', choices=['true', 'false'], help='是否对代码嵌入做 L2 归一化')
     parser.add_argument('--code_batch_size', type=int, default=8, help='预编码代码嵌入的批大小')
     
     # 调试参数
