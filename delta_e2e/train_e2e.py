@@ -1921,6 +1921,11 @@ def main():
     parser.add_argument('--batch_size', type=int, default=32, help='批大小')
     parser.add_argument('--lr', type=float, default=0.001, help='学习率')
     parser.add_argument('--epochs', type=int, default=100, help='训练轮数')
+    parser.add_argument('--lr_factor', type=float, default=0.8, help='ReduceLROnPlateau 的衰减因子')
+    parser.add_argument('--lr_patience', type=int, default=15, help='ReduceLROnPlateau 的耐心值')
+    parser.add_argument('--lr_threshold', type=float, default=1e-4, help='ReduceLROnPlateau 的改进阈值')
+    parser.add_argument('--lr_threshold_mode', type=str, default='rel', choices=['rel', 'abs'],
+                        help='ReduceLROnPlateau 的阈值模式（rel/abs）')
     parser.add_argument('--device', type=int, default=0, help='GPU设备ID')
     parser.add_argument('--loss_type', type=str, default='mae',
                         choices=['mae', 'mse', 'smoothl1'],
@@ -1962,7 +1967,7 @@ def main():
     
     # 训练策略参数
     parser.add_argument('--warmup_epochs', type=int, default=10, help='Linear warmup 的 epoch 数（0 表示关闭）')
-    parser.add_argument('--min_lr', type=float, default=1e-5, help='学习率下限（避免过小导致训练停滞）')
+    parser.add_argument('--min_lr', type=float, default=1e-4, help='学习率下限（避免过小导致训练停滞）')
     parser.add_argument('--apply_hard_filter', type=str, default='true', choices=['true', 'false'],
                         help='是否过滤无效设计（基于稳健分位 p05-p95）')
     parser.add_argument('--normalize_targets', type=str, default='true', choices=['true', 'false'],
@@ -2324,7 +2329,15 @@ def main():
     
     # 优化器和调度器
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.8, patience=15)
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=args.lr_factor,
+        patience=args.lr_patience,
+        threshold=args.lr_threshold,
+        threshold_mode=args.lr_threshold_mode,
+        min_lr=args.min_lr
+    )
     
     # 学习率工具函数
     def _set_optimizer_lr(optim_obj, lr_value):
@@ -2340,7 +2353,13 @@ def main():
         "model/node_dim": node_dim,
         "model/total_params": model_params,
         "model/hidden_dim": args.hidden_dim,
-        "model/num_layers": args.num_layers
+        "model/num_layers": args.num_layers,
+        "optimizer/type": "Adam",
+        "optimizer/factor": args.lr_factor,
+        "optimizer/patience": args.lr_patience,
+        "optimizer/threshold": args.lr_threshold,
+        "optimizer/threshold_mode": args.lr_threshold_mode,
+        "scheduler/min_lr": args.min_lr
     })
     
     # ==================== 训练循环 ====================
@@ -2410,18 +2429,17 @@ def main():
         # 学习率调度（warmup 期间不触发 ReduceLROnPlateau）
         if not args.warmup_epochs or epoch > args.warmup_epochs:
             scheduler.step(valid_loss)
-            # 下限保护，避免 lr 过小
             try:
-                cur_lr = scheduler.get_last_lr()[0]
+                current_lr = scheduler.get_last_lr()[0]
             except Exception:
-                cur_lr = _get_optimizer_lr(optimizer)
-            if cur_lr < args.min_lr:
+                current_lr = _get_optimizer_lr(optimizer)
+            if current_lr < args.min_lr:
                 _set_optimizer_lr(optimizer, args.min_lr)
-        
-        try:
-            current_lr = scheduler.get_last_lr()[0]
-        except Exception:
-            current_lr = _get_optimizer_lr(optimizer)
+        else:
+            try:
+                current_lr = scheduler.get_last_lr()[0]
+            except Exception:
+                current_lr = _get_optimizer_lr(optimizer)
         lr_history.append(current_lr)
         
         # 记录到SwanLab（ID test / OOD test 区分）
