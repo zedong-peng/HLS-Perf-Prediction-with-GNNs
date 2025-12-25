@@ -17,8 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data, DataLoader, Batch
-from torch_geometric.nn import GCNConv, global_mean_pool, global_add_pool, PNAConv
-from torch_geometric.nn import RGCNConv, FastRGCNConv, GINConv, GraphNorm
+from torch_geometric.nn import GATConv, GCNConv, PNAConv, SAGEConv, global_add_pool, global_mean_pool
+from torch_geometric.nn import FastRGCNConv, GINConv, GraphNorm, RGCNConv
 from torch_geometric.utils import degree
 import torch.optim as optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -1185,6 +1185,7 @@ class SimpleDifferentialGNN(nn.Module):
         self.edge_dim = max(0, edge_dim or 0)
         self.use_code_feature = bool(use_code_feature)
         self.code_dim = code_dim
+        self.dropout = dropout
         if self.use_code_feature and (self.code_dim is None or self.code_dim <= 0):
             raise ValueError("use_code_feature=True 需要提供有效的 code_dim")
 
@@ -1270,6 +1271,14 @@ class SimpleDifferentialGNN(nn.Module):
         for _ in range(self.num_layers):
             if self.gnn_type == 'gcn':
                 convs.append(GCNConv(self.hidden_dim, self.hidden_dim))
+            elif self.gnn_type == 'gat':
+                convs.append(GATConv(
+                    in_channels=self.hidden_dim,
+                    out_channels=self.hidden_dim,
+                    heads=4,
+                    concat=False,
+                    dropout=self.dropout
+                ))
             elif self.gnn_type == 'gin':
                 mlp = nn.Sequential(
                     nn.Linear(self.hidden_dim, self.hidden_dim),
@@ -1278,6 +1287,8 @@ class SimpleDifferentialGNN(nn.Module):
                     nn.Linear(self.hidden_dim, self.hidden_dim)
                 )
                 convs.append(GINConv(mlp))
+            elif self.gnn_type == 'graphsage':
+                convs.append(SAGEConv(self.hidden_dim, self.hidden_dim))
             elif self.gnn_type == 'rgcn':
                 convs.append(RGCNConv(self.hidden_dim, self.hidden_dim, num_relations=get_edge_feature_dims()[0], num_bases=30))
             elif self.gnn_type == 'fast_rgcn':
@@ -1301,7 +1312,10 @@ class SimpleDifferentialGNN(nn.Module):
                     )
                 )
             else:
-                raise ValueError(f"不支持的GNN类型: {self.gnn_type}. 支持的类型: gcn, gin, rgcn, fast_rgcn, pna")
+                raise ValueError(
+                    f"不支持的GNN类型: {self.gnn_type}. 支持的类型: "
+                    "gcn, gat, graphsage, gin, rgcn, fast_rgcn, pna"
+                )
 
             graph_norms.append(GraphNorm(self.hidden_dim))
 
@@ -1331,7 +1345,11 @@ class SimpleDifferentialGNN(nn.Module):
         for i, conv in enumerate(convs):
             if self.gnn_type == 'gcn':
                 x = conv(x, data.edge_index)
+            elif self.gnn_type == 'gat':
+                x = conv(x, data.edge_index)
             elif self.gnn_type == 'gin':
+                x = conv(x, data.edge_index)
+            elif self.gnn_type == 'graphsage':
                 x = conv(x, data.edge_index)
             elif self.gnn_type in ['rgcn', 'fast_rgcn']:
                 edge_type = data.edge_attr[:, 0].long() if hasattr(data, 'edge_attr') and data.edge_attr is not None else torch.zeros(data.edge_index.size(1), dtype=torch.long, device=data.edge_index.device)
@@ -1911,7 +1929,7 @@ def main():
     parser.add_argument('--num_layers', type=int, default=2, help='GNN层数（设计/Kernel各自独立但层数一致）')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout率')
     parser.add_argument('--gnn_type', type=str, default='gcn',
-                        choices=['gcn', 'gin', 'rgcn', 'fast_rgcn', 'pna'],
+                        choices=['gcn', 'gat', 'graphsage', 'gin', 'rgcn', 'fast_rgcn', 'pna'],
                         help='GNN架构类型')
     parser.add_argument('--kernel_baseline', type=str, default='learned',
                         choices=['learned', 'oracle'],
