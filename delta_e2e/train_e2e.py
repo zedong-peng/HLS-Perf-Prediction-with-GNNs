@@ -17,7 +17,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data, DataLoader, Batch
-from torch_geometric.nn import GATConv, GCNConv, PNAConv, SAGEConv, global_add_pool, global_mean_pool
+from torch_geometric.nn import (
+    GATConv, GCNConv, PNAConv, SAGEConv,
+    global_add_pool, global_mean_pool, global_max_pool, Set2Set, GlobalAttention
+)
 from torch_geometric.nn import FastRGCNConv, GINConv, GraphNorm, RGCNConv
 from torch_geometric.utils import degree
 import torch.optim as optim
@@ -122,12 +125,31 @@ except ModuleNotFoundError:
     )
 
 # 可用资源数量（用于计算ulti-RMSE）
-AVAILABLE_RESOURCES = { 
+AVAILABLE_RESOURCES = {
     'dsp': 9024,
     'lut': 1303680,
     'ff': 2607360,
     'bram_18k': 4032
 }
+
+# 统一的指标名与索引映射（包含 latency 全系列与 cp）
+METRIC_INDEX = {
+    'dsp': 0,
+    'lut': 1,
+    'ff': 2,
+    'best_latency': 3,
+    'avg_latency': 4,
+    'worst_latency': 5,
+    'cp': 6,
+    # 兼容旧名
+    'latency': 3,
+}
+
+def canonical_metric_name(name: str) -> str:
+    """兼容旧 target_metric，统一到内部使用的指标名。"""
+    if name == 'latency':
+        return 'best_latency'
+    return name
 
 
 LOSS_FUNCTION_REGISTRY = {
@@ -157,13 +179,15 @@ class E2EDifferentialProcessor:
     def __init__(self, kernel_base_dir: str, design_base_dir: str, output_dir: str,
                  cache_root: str = "./graph_cache", rebuild_cache: bool = False, hierarchical: bool = False, region: bool = False, max_workers: Optional[int] = None,
                  use_code_feature: bool = False, code_model_path: Optional[str] = None, code_cache_root: Optional[str] = None,
-                 code_pooling: str = "last_token", code_max_length: int = 2048, code_normalize: bool = True, code_batch_size: int = 8):
+                 code_pooling: str = "last_token", code_max_length: int = 2048, code_normalize: bool = True, code_batch_size: int = 8,
+                 graph_pooling: str = "sum"):
         self.kernel_base_dir = kernel_base_dir
         self.design_base_dir = design_base_dir
         self.output_dir = output_dir
         self.rebuild_cache = rebuild_cache
         self.hierarchical = hierarchical  # 是否启用分层区域节点
         self.region = region  # 是否启用 region 信息
+        self.graph_pooling = graph_pooling
         self.use_code_feature = bool(use_code_feature)
         self.code_model_path = code_model_path
         self.code_pooling = code_pooling
@@ -187,7 +211,7 @@ class E2EDifferentialProcessor:
         kb = os.path.abspath(self.kernel_base_dir)
         db = os.path.abspath(self.design_base_dir)
         # 在cache key中加入特征版本，避免特征维度变化导致旧缓存失配；图缓存不绑定代码特征，便于独立演进
-        feature_version = "featv=20250924.0"
+        feature_version = "featv=20250924.1"
         cache_key_src = f"kb={kb}|db={db}|hier={'1' if self.hierarchical else '0'}|region={'1' if self.region else '0'}|{feature_version}"
         cache_key = hashlib.md5(cache_key_src.encode("utf-8")).hexdigest()[:12]
         self.graph_cache_dir = os.path.join(cache_root, cache_key)
@@ -241,6 +265,16 @@ class E2EDifferentialProcessor:
         )
         return self._code_embedder
 
+    @staticmethod
+    def _sanitize_embedding(emb: torch.Tensor) -> torch.Tensor:
+        """清洗代码嵌入中的 NaN/Inf，避免后续模型输出出现 NaN。"""
+        if emb is None:
+            return emb
+        emb = emb.to(dtype=torch.float)
+        if torch.isnan(emb).any() or torch.isinf(emb).any():
+            emb = torch.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
+        return emb
+
     def _read_design_code(self, design_path: Path) -> Tuple[Optional[str], Optional[str]]:
         """读取 design 目录中的 .c/.cpp 源码并返回拼接字符串及哈希。"""
         code_files = sorted(
@@ -273,6 +307,15 @@ class E2EDifferentialProcessor:
             cached = torch.load(cache_path, map_location='cpu')
             emb = cached.get('embedding')
             meta = cached.get('meta', {})
+            if emb is not None:
+                cleaned = self._sanitize_embedding(emb)
+                if cleaned is not emb:
+                    cached['embedding'] = cleaned
+                    try:
+                        torch.save(cached, cache_path)
+                    except Exception:
+                        pass
+                emb = cleaned
             expected_cfg = {
                 "model_path": self.code_model_path,
                 "pooling": self.code_pooling,
@@ -299,6 +342,7 @@ class E2EDifferentialProcessor:
         with torch.inference_mode():
             embeddings = embedder.encode(texts)
         for emb, (design_path, _, code_hash) in zip(embeddings, batch_entries):
+            emb = self._sanitize_embedding(emb)
             cache_path = self._code_cache_path(design_path, code_hash)
             meta = {
                 "design_path": str(design_path),
@@ -372,6 +416,7 @@ class E2EDifferentialProcessor:
             embedder = self._get_code_embedder()
             with torch.inference_mode():
                 emb = embedder.encode([code_text])[0]
+            emb = self._sanitize_embedding(emb)
             meta = {
                 "design_path": str(design_path),
                 "code_hash": code_hash,
@@ -636,27 +681,42 @@ class E2EDifferentialProcessor:
             return None
     
     def _parse_csynth_xml(self, xml_path: Path) -> Optional[Dict]:
-        """解析csynth.xml文件"""
+        """解析csynth.xml文件，提取资源、延迟（cycle）与时钟周期（ns）"""
         try:
             tree = ET.parse(xml_path)
             root = tree.getroot()
             
             # 提取性能数据
             best_latency = root.find('.//PerformanceEstimates/SummaryOfOverallLatency/Best-caseLatency')
+            avg_latency = root.find('.//PerformanceEstimates/SummaryOfOverallLatency/Average-caseLatency')
+            worst_latency = root.find('.//PerformanceEstimates/SummaryOfOverallLatency/Worst-caseLatency')
             dsp = root.find('.//AreaEstimates/Resources/DSP')
             lut = root.find('.//AreaEstimates/Resources/LUT')
             ff = root.find('.//AreaEstimates/Resources/FF')
+            cp = root.find('.//PerformanceEstimates/SummaryOfTimingAnalysis/EstimatedClockPeriod')
             
-            if (best_latency is not None and best_latency.text != 'undef' and
-                dsp is not None and lut is not None and ff is not None):
-                
+            def _valid_latency(ele):
+                return ele is not None and ele.text not in (None, 'undef')
+            
+            if all([
+                _valid_latency(best_latency),
+                _valid_latency(avg_latency),
+                _valid_latency(worst_latency),
+                dsp is not None,
+                lut is not None,
+                ff is not None,
+                cp is not None and cp.text not in (None, 'undef')
+            ]):
                 return {
                     'best_latency': float(best_latency.text),
+                    'avg_latency': float(avg_latency.text),
+                    'worst_latency': float(worst_latency.text),
                     'DSP': int(dsp.text),
                     'LUT': int(lut.text),
-                    'FF': int(ff.text)
+                    'FF': int(ff.text),
+                    'CP': float(cp.text)
                 }
-        except Exception as e:
+        except Exception:
             return None
         
         return None
@@ -846,13 +906,23 @@ class E2EDifferentialProcessor:
             # 获取性能数据
             k_perf = kernel_data['performance']
             d_perf = design_data['performance']
+
+            # 必须有完整的性能字段，否则跳过以避免填充0污染数据
+            required_keys = ['DSP', 'LUT', 'FF', 'best_latency', 'avg_latency', 'worst_latency', 'CP']
+            if any((k not in k_perf or k_perf[k] is None) for k in required_keys):
+                return None
+            if any((k not in d_perf or d_perf[k] is None) for k in required_keys):
+                return None
             
             # 计算性能差值（不归一化，保持原始值）
             performance_delta = {
-                'latency_delta': d_perf['best_latency'] - k_perf['best_latency'],
+                'best_latency_delta': d_perf['best_latency'] - k_perf['best_latency'],
+                'avg_latency_delta': d_perf['avg_latency'] - k_perf['avg_latency'],
+                'worst_latency_delta': d_perf['worst_latency'] - k_perf['worst_latency'],
                 'dsp_delta': d_perf['DSP'] - k_perf['DSP'],
                 'lut_delta': d_perf['LUT'] - k_perf['LUT'],
-                'ff_delta': d_perf['FF'] - k_perf['FF']
+                'ff_delta': d_perf['FF'] - k_perf['FF'],
+                'cp_delta': d_perf['CP'] - k_perf['CP']
             }
             
             # 添加性能标签到图数据 - 使用原始值，不进行归一化
@@ -863,14 +933,20 @@ class E2EDifferentialProcessor:
                 k_perf['DSP'],
                 k_perf['LUT'],
                 k_perf['FF'],
-                k_perf['best_latency']
+                k_perf['best_latency'],
+                k_perf['avg_latency'],
+                k_perf['worst_latency'],
+                k_perf['CP']
             ], dtype=torch.float).unsqueeze(0)
             
             design_graph.y = torch.tensor([
                 d_perf['DSP'],
                 d_perf['LUT'],
                 d_perf['FF'],
-                d_perf['best_latency']
+                d_perf['best_latency'],
+                d_perf['avg_latency'],
+                d_perf['worst_latency'],
+                d_perf['CP']
             ], dtype=torch.float).unsqueeze(0)
             
             return {
@@ -1014,7 +1090,9 @@ class E2EDifferentialProcessor:
                 value = float(raw_value)
             except (TypeError, ValueError):
                 continue
-            if value > 0.1 * AVAILABLE_RESOURCES[normalized_key]:
+            # 允许资源使用量达到设备上限（留出5%裕度以兼容估计误差）
+            max_allowed = AVAILABLE_RESOURCES[normalized_key] * 1.05
+            if value > max_allowed:
                 return False
         return True
 
@@ -1070,6 +1148,14 @@ class E2EDifferentialProcessor:
         records: List[Dict] = []
         filtered_out = 0
 
+        # 索引缺失但已有 pair 文件时，尝试自动重建索引后再读取
+        if not os.path.exists(self.index_path):
+            if os.path.isdir(self.pairs_dir) and any(Path(self.pairs_dir).glob("*.pt")):
+                rebuilt = self._rebuild_index_from_pairs()
+                if rebuilt > 0:
+                    return self._load_cached_pairs(limit=limit, materialize=materialize)
+            return records
+
         if os.path.exists(self.index_path):
             with open(self.index_path, 'r', encoding='utf-8') as index_f:
                 for line in index_f:
@@ -1109,6 +1195,11 @@ class E2EDifferentialProcessor:
                         break
             if filtered_out > 0:
                 print(f"过滤资源超限的缓存样本: {filtered_out}")
+            # 如果索引存在但未能加载到记录，尝试重建索引（例如之前索引被清空）
+            if not records and os.path.isdir(self.pairs_dir) and any(Path(self.pairs_dir).glob("*.pt")):
+                rebuilt = self._rebuild_index_from_pairs()
+                if rebuilt > 0:
+                    return self._load_cached_pairs(limit=limit, materialize=materialize)
             return records
 
         # 兜底：无新格式索引，返回空列表
@@ -1174,9 +1265,10 @@ class SimpleDifferentialGNN(nn.Module):
                  dropout: float = 0.1, target_metric: str = 'dsp', differential: bool = True,
                  gnn_type: str = 'gcn', kernel_baseline: str = 'learned',
                  pna_deg: Optional[torch.Tensor] = None, edge_dim: Optional[int] = None,
-                 use_code_feature: bool = False, code_dim: Optional[int] = None):
+                 use_code_feature: bool = False, code_dim: Optional[int] = None,
+                 graph_pooling: str = "sum"):
         super().__init__()
-        self.target_metric = target_metric
+        self.target_metric = canonical_metric_name(target_metric)
         self.hidden_dim = hidden_dim
         self.num_layers = int(num_layers)
         self.differential = differential
@@ -1186,6 +1278,8 @@ class SimpleDifferentialGNN(nn.Module):
         self.use_code_feature = bool(use_code_feature)
         self.code_dim = code_dim
         self.dropout = dropout
+        self.graph_pooling = graph_pooling.lower()
+        self.graph_global_dim = 2  # log1p(num_nodes), log1p(num_edges)
         if self.use_code_feature and (self.code_dim is None or self.code_dim <= 0):
             raise ValueError("use_code_feature=True 需要提供有效的 code_dim")
 
@@ -1196,6 +1290,9 @@ class SimpleDifferentialGNN(nn.Module):
         for idx in self.one_hot_node_fields:
             expanded_node_dim += self.node_feature_dims[idx]
         self.expanded_node_dim = expanded_node_dim
+        # 预先构建 attention / set2set 池化器（需要节点维度）
+        self._graph_attention = GlobalAttention(nn.Linear(self.hidden_dim, 1))
+        self._graph_set2set = Set2Set(self.hidden_dim, processing_steps=3)
 
         # 设计 / Kernel 各自的 GNN 组件
         self.design_node_encoder: nn.Module
@@ -1242,19 +1339,19 @@ class SimpleDifferentialGNN(nn.Module):
                 raise ValueError("kernel_baseline 必须为 learned 或 oracle")
             # kernel 头只基于 kernel 表征
             if self.kernel_baseline == 'learned':
-                self.kernel_head = _make_head(hidden_dim)
+                self.kernel_head = _make_head(hidden_dim + self.graph_global_dim)
             # delta 头融合多种交互项
-            delta_input_dim = hidden_dim * 2
+            delta_input_dim = (hidden_dim + self.graph_global_dim) * 2
             if self.use_code_feature:
                 delta_input_dim += self.code_feature_dim  # 设计代码模态
             self.delta_head = _make_head(delta_input_dim)
         else:
             # 直接预测头
-            design_input_dim = hidden_dim + (self.code_feature_dim if self.use_code_feature else 0)
+            design_input_dim = hidden_dim + self.graph_global_dim + (self.code_feature_dim if self.use_code_feature else 0)
             self.design_head = _make_head(design_input_dim)
 
         # 指标索引映射
-        self.metric_idx = {'dsp': 0, 'lut': 1, 'ff': 2, 'latency': 3}[target_metric]
+        self.metric_idx = METRIC_INDEX[self.target_metric]
 
         # 权重初始化
         self._init_weights()
@@ -1375,6 +1472,15 @@ class SimpleDifferentialGNN(nn.Module):
             if i < len(convs) - 1:
                 x = F.relu(x)
         
+        # 根据配置选择池化方式
+        if self.graph_pooling == 'mean':
+            return global_mean_pool(x, batch_vec)
+        if self.graph_pooling == 'max':
+            return global_max_pool(x, batch_vec)
+        if self.graph_pooling == 'attention':
+            return self._graph_attention(x, batch_vec)
+        if self.graph_pooling == 'set2set':
+            return self._graph_set2set(x, batch_vec)
         return global_add_pool(x, batch_vec)
 
     def _expand_node_features(self, x: torch.Tensor) -> torch.Tensor:
@@ -1390,6 +1496,18 @@ class SimpleDifferentialGNN(nn.Module):
                 parts.append(col.float().unsqueeze(-1))
         return torch.cat(parts, dim=-1)
     
+    def _compute_global_feats(self, graph: Data) -> torch.Tensor:
+        """计算每个子图的 log1p(num_nodes)、log1p(num_edges) 作为全局特征。"""
+        batch_vec = graph.batch
+        num_graphs = int(batch_vec.max().item()) + 1 if batch_vec.numel() > 0 else 1
+        node_counts = torch.bincount(batch_vec, minlength=num_graphs).float()
+        if graph.edge_index is not None and graph.edge_index.numel() > 0:
+            edge_batch = batch_vec[graph.edge_index[0]]
+            edge_counts = torch.bincount(edge_batch, minlength=num_graphs).float()
+        else:
+            edge_counts = torch.zeros(num_graphs, device=node_counts.device)
+        return torch.stack([torch.log1p(node_counts), torch.log1p(edge_counts)], dim=1)
+    
     def forward(self, kernel_graph, design_graph, pragma_count, design_code: Optional[torch.Tensor] = None):
         """前向传播 - 支持差分和直接预测两种模式"""
         # 编码图
@@ -1404,14 +1522,19 @@ class SimpleDifferentialGNN(nn.Module):
             # 差分模式：先预测 kernel，再预测 delta
             kernel_repr = self.encode_graph(kernel_graph, branch='kernel')
             if self.kernel_baseline == 'learned':
-                kernel_pred = self.kernel_head(kernel_repr)
+                kernel_global = self._compute_global_feats(kernel_graph)
+                kernel_repr_with_global = torch.cat([kernel_repr, kernel_global], dim=-1)
+                kernel_pred = self.kernel_head(kernel_repr_with_global)
             else:
                 if not hasattr(kernel_graph, 'y'):
                     raise ValueError("oracle kernel 基线需要 kernel_graph.y 提供真实指标")
                 kernel_pred = kernel_graph.y[:, self.metric_idx].unsqueeze(-1).to(kernel_repr.device)
 
             # 构建 delta 输入：包含 kernel/design 表征及其交互
-            delta_parts = [kernel_repr, design_repr]
+            design_global = self._compute_global_feats(design_graph)
+            kernel_global = self._compute_global_feats(kernel_graph)
+            delta_parts = [torch.cat([kernel_repr, kernel_global], dim=-1),
+                           torch.cat([design_repr, design_global], dim=-1)]
             if code_repr is not None:
                 delta_parts.append(code_repr)
             delta_input = torch.cat(delta_parts, dim=-1)
@@ -1426,7 +1549,8 @@ class SimpleDifferentialGNN(nn.Module):
             }
         else:
             # 直接预测模式：只使用design
-            design_parts = [design_repr]
+            design_global = self._compute_global_feats(design_graph)
+            design_parts = [torch.cat([design_repr, design_global], dim=-1)]
             if code_repr is not None:
                 design_parts.append(code_repr)
             design_input = torch.cat(design_parts, dim=-1)
@@ -1443,8 +1567,8 @@ class E2EDifferentialDataset(torch.utils.data.Dataset):
     
     def __init__(self, pairs: List[Dict], target_metric: str = 'dsp'):
         self.pairs = pairs
-        self.target_metric = target_metric
-        self.metric_idx = {'dsp': 0, 'lut': 1, 'ff': 2, 'latency': 3}[target_metric]
+        self.target_metric = canonical_metric_name(target_metric)
+        self.metric_idx = METRIC_INDEX[self.target_metric]
     
     def __len__(self):
         return len(self.pairs)
@@ -1460,7 +1584,7 @@ class E2EDifferentialDataset(torch.utils.data.Dataset):
         design_perf = design_graph.y[0, self.metric_idx].unsqueeze(0)
         
         # 计算差值
-        delta_key = f'{self.target_metric}_delta' if self.target_metric != 'latency' else 'latency_delta'
+        delta_key = f'{self.target_metric}_delta'
         perf_delta = torch.tensor([pair['performance_delta'][delta_key]], dtype=torch.float)
         
         # Pragma计数
@@ -1568,7 +1692,6 @@ def _compute_basic_stats(values: List[float]) -> Dict[str, float]:
         "p95": float(p95)
     }
 
-
 def _extract_metric_values(pairs: List[Dict], metric_idx: int, delta_key: str) -> Dict[str, List[float]]:
     kernel_vals: List[float] = []
     design_vals: List[float] = []
@@ -1601,11 +1724,14 @@ def _fit_robust_scaler(values: List[float]) -> RobustScaler:
 
 def train_epoch(model, device, train_loader, optimizer, loss_fn=None, grad_accum_steps=1,
                max_grad_norm=1.0, use_tqdm: bool = False, progress_desc: Optional[str] = None,
-               normalizers: Optional[Dict[str, RobustScaler]] = None):
-    """训练一个epoch"""
+               normalizers: Optional[Dict[str, RobustScaler]] = None) -> Dict[str, float]:
+    """训练一个epoch，返回总loss及各子项平均值"""
     model.train()
     loss_fn = loss_fn or F.l1_loss
     loss_sum_gpu = torch.zeros(1, device=device)
+    design_loss_sum = torch.zeros(1, device=device)
+    delta_loss_sum = torch.zeros(1, device=device)
+    kernel_loss_sum = torch.zeros(1, device=device)
     batch_count = 0
     
     optimizer.zero_grad(set_to_none=True)
@@ -1652,10 +1778,14 @@ def train_epoch(model, device, train_loader, optimizer, loss_fn=None, grad_accum
             kernel_loss = loss_fn(_norm(kernel_pred, 'kernel'), _norm(target_kernel, 'kernel'))
 
             loss = kernel_loss + delta_loss + design_loss
+            design_loss_sum += design_loss.detach()
+            delta_loss_sum += delta_loss.detach()
+            kernel_loss_sum += kernel_loss.detach()
         else:
             design_pred = predictions['direct_pred'].view(-1)
             target_design = targets['design_perf'].view(-1)
             loss = loss_fn(_norm(design_pred, 'design'), _norm(target_design, 'design'))
+            design_loss_sum += loss.detach()
         
         # 梯度累积缩放
         loss_scaled = loss / max(1, grad_accum_steps)
@@ -1675,15 +1805,26 @@ def train_epoch(model, device, train_loader, optimizer, loss_fn=None, grad_accum
         batch_count += 1
     
     # 仅在epoch末同步到CPU
-    return (loss_sum_gpu.item() / batch_count) if batch_count > 0 else float('inf')
+    if batch_count == 0:
+        return {"total_loss": float('inf'), "design_loss": float('inf'), "delta_loss": float('inf'), "kernel_loss": float('inf')}
+    return {
+        "total_loss": loss_sum_gpu.item() / batch_count,
+        "design_loss": design_loss_sum.item() / batch_count,
+        "delta_loss": delta_loss_sum.item() / batch_count if model.differential else None,
+        "kernel_loss": kernel_loss_sum.item() / batch_count if model.differential else None
+    }
 
 
 def evaluate_model(model, data_loader, device, target_metric='dsp', return_predictions=False, loss_fn=None,
                    normalizers: Optional[Dict[str, RobustScaler]] = None):
     """评估模型性能 - 返回设计绝对指标并可选记录差值诊断信息"""
+    target_metric = canonical_metric_name(target_metric)
     model.eval()
     loss_fn = loss_fn or F.l1_loss
     total_loss = 0
+    total_design_loss = 0
+    total_delta_loss = 0
+    total_kernel_loss = 0
     batch_count = 0
 
     all_design_preds = []
@@ -1760,6 +1901,9 @@ def evaluate_model(model, data_loader, device, target_metric='dsp', return_predi
 
     # 计算评估指标
     avg_loss = total_loss / batch_count if batch_count > 0 else float('inf')
+    avg_design_loss = total_design_loss / batch_count if batch_count > 0 else None
+    avg_delta_loss = (total_delta_loss / batch_count) if (batch_count > 0 and total_delta_loss > 0) else None
+    avg_kernel_loss = (total_kernel_loss / batch_count) if (batch_count > 0 and total_kernel_loss > 0) else None
 
     if all_design_preds:
         design_preds = torch.cat(all_design_preds, dim=0)
@@ -1786,6 +1930,9 @@ def evaluate_model(model, data_loader, device, target_metric='dsp', return_predi
 
         metrics_dict = {
             'avg_loss': avg_loss,
+            'avg_design_loss': avg_design_loss,
+            'avg_delta_loss': avg_delta_loss,
+            'avg_kernel_loss': avg_kernel_loss,
             'design_mae': design_mae,
             'design_rmse': design_rmse,
             'design_r2': design_r2,
@@ -1923,8 +2070,8 @@ def main():
     
     # 模型参数
     parser.add_argument('--target_metric', type=str, default=None,
-                        choices=['dsp', 'lut', 'ff', 'latency'],
-                        help='目标预测指标')
+                        choices=['dsp', 'lut', 'ff', 'latency', 'best_latency', 'avg_latency', 'worst_latency', 'cp'],
+                        help='目标预测指标（latency 默认等同 best_latency）')
     parser.add_argument('--hidden_dim', type=int, default=128, help='隐藏层维度')
     parser.add_argument('--num_layers', type=int, default=2, help='GNN层数（设计/Kernel各自独立但层数一致）')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout率')
@@ -1997,6 +2144,9 @@ def main():
     # Region 信息开关
     parser.add_argument('--region', type=str, default='off', choices=['on', 'off'],
                         help='是否启用 region 信息（构图元数据中记录），on/off')
+    parser.add_argument('--graph_pooling', type=str, default='sum',
+                        choices=['sum', 'mean', 'max', 'attention', 'set2set'],
+                        help='图级池化方式，影响设计/kernel 表征汇聚')
 
     # 并行构建图cache参数
     parser.add_argument('--max_workers', type=int, default=32,
@@ -2120,8 +2270,8 @@ def main():
         log_status(f"[Step3.6] 调试模式：截断配对数至 {args.max_pairs}")
 
     # 统计原始分布并保存
-    metric_idx = {'dsp': 0, 'lut': 1, 'ff': 2, 'latency': 3}[args.target_metric]
-    delta_key = f'{args.target_metric}_delta' if args.target_metric != 'latency' else 'latency_delta'
+    metric_idx = METRIC_INDEX[canonical_metric_name(args.target_metric)]
+    delta_key = f'{canonical_metric_name(args.target_metric)}_delta'
     raw_stats = {k: _compute_basic_stats(v) for k, v in _extract_metric_values(pairs, metric_idx, delta_key).items()}
     stats_path = os.path.join(output_dir, 'target_metric_stats.json')
     with open(stats_path, 'w') as sf:
@@ -2341,7 +2491,8 @@ def main():
         pna_deg=pna_deg,
         edge_dim=edge_dim,
         use_code_feature=(args.use_code_feature.lower() == 'true'),
-        code_dim=code_dim
+        code_dim=code_dim,
+        graph_pooling=args.graph_pooling
     ).to(device)
     log_status("[Step8] 模型初始化完成，开始训练循环准备")
     
@@ -2404,7 +2555,7 @@ def main():
         
         # 训练
         print(f"[Epoch {epoch}/{args.epochs}] 开始训练...", flush=True)
-        train_loss = train_epoch(
+        train_loss_stats = train_epoch(
             model, device, train_loader, optimizer,
             loss_fn=loss_fn,
             grad_accum_steps=args.grad_accum_steps,
@@ -2412,7 +2563,7 @@ def main():
             use_tqdm=True,
             progress_desc=f"Train {epoch}/{args.epochs}"
         )
-        train_losses.append(train_loss)
+        train_losses.append(train_loss_stats["total_loss"])
         
         # 验证
         valid_metrics = evaluate_model(
@@ -2463,11 +2614,17 @@ def main():
         # 记录到SwanLab（ID test / OOD test 区分）
         log_payload = {
             "epoch": epoch,
-            "train/loss": train_loss,
+            "train/loss": train_loss_stats["total_loss"],
             "valid/loss": valid_loss,
             "id_test/loss": id_test_loss,
             "optimizer/lr": current_lr
         }
+        if train_loss_stats.get("design_loss") is not None:
+            log_payload["train/design_loss"] = train_loss_stats["design_loss"]
+        if train_loss_stats.get("delta_loss") is not None:
+            log_payload["train/delta_loss"] = train_loss_stats["delta_loss"]
+        if train_loss_stats.get("kernel_loss") is not None:
+            log_payload["train/kernel_loss"] = train_loss_stats["kernel_loss"]
 
         for split_name, split_metrics in [("valid", valid_metrics), ("id_test", id_test_metrics)]:
             log_payload[f"{split_name}/design_mae"] = split_metrics.get('design_mae', 0)
@@ -2475,6 +2632,13 @@ def main():
             log_payload[f"{split_name}/design_mape"] = split_metrics.get('design_mape', 0)
             log_payload[f"{split_name}/design_r2"] = split_metrics.get('design_r2', 0)
             log_payload[f"{split_name}/design_ulti_rmse"] = split_metrics.get('design_ulti_rmse', 0)
+            # 记录 loss 分解
+            if split_metrics.get('avg_design_loss') is not None:
+                log_payload[f"{split_name}/design_loss"] = split_metrics.get('avg_design_loss', 0)
+            if split_metrics.get('avg_delta_loss') is not None:
+                log_payload[f"{split_name}/delta_loss"] = split_metrics.get('avg_delta_loss', 0)
+            if split_metrics.get('avg_kernel_loss') is not None:
+                log_payload[f"{split_name}/kernel_loss"] = split_metrics.get('avg_kernel_loss', 0)
 
             log_payload[f"{split_name}/kernel_mae"] = split_metrics.get('kernel_mae', 0)
             log_payload[f"{split_name}/kernel_rmse"] = split_metrics.get('kernel_rmse', 0)
@@ -2512,11 +2676,17 @@ def main():
                     "ood_test/delta_r2": ood_test_metrics.get('delta_r2', 0),
                     "ood_test/delta_ulti_rmse": ood_test_metrics.get('delta_ulti_rmse', 0)
                 })
+            if ood_test_metrics.get('avg_design_loss') is not None:
+                log_payload["ood_test/design_loss"] = ood_test_metrics.get('avg_design_loss', 0)
+            if ood_test_metrics.get('avg_delta_loss') is not None:
+                log_payload["ood_test/delta_loss"] = ood_test_metrics.get('avg_delta_loss', 0)
+            if ood_test_metrics.get('avg_kernel_loss') is not None:
+                log_payload["ood_test/kernel_loss"] = ood_test_metrics.get('avg_kernel_loss', 0)
 
         swanlab.log(log_payload)
         summary_msg = (
             f"[Epoch {epoch}/{args.epochs}] 训练完成 | "
-            f"train_loss={train_loss:.6f}, valid_loss={valid_loss:.6f}, "
+            f"train_loss={train_loss_stats['total_loss']:.6f}, valid_loss={valid_loss:.6f}, "
             f"id_test_loss={id_test_loss:.6f}, lr={current_lr:.6f}"
         )
         if ood_test_metrics is not None:
@@ -2540,6 +2710,7 @@ def main():
             }, model_path)
             
             swanlab.log({"best_model/epoch": epoch, "best_model/valid_loss": valid_loss})
+
     
     # ==================== 保存结果 ====================
     

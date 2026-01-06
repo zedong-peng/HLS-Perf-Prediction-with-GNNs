@@ -27,7 +27,7 @@ try:
     from delta_e2e.train_e2e import (
         E2EDifferentialProcessor, SimpleDifferentialGNN, 
         E2EDifferentialDataset, evaluate_model, differential_collate_fn,
-        resolve_loss_function
+        resolve_loss_function, METRIC_INDEX, _extract_metric_values, _compute_basic_stats, canonical_metric_name
     )
 except ImportError:
     # 如果作为模块导入失败，使用相对导入
@@ -35,7 +35,7 @@ except ImportError:
     from train_e2e import (
         E2EDifferentialProcessor, SimpleDifferentialGNN,
         E2EDifferentialDataset, evaluate_model, differential_collate_fn,
-        resolve_loss_function
+        resolve_loss_function, METRIC_INDEX, _extract_metric_values, _compute_basic_stats, canonical_metric_name
     )
 
 
@@ -140,6 +140,24 @@ def main():
     parser.add_argument('--loss_type', type=str, default=None,
                         choices=['mae', 'mse', 'smoothl1'],
                         help='评估时使用的损失函数（默认使用模型训练时的配置）')
+    # 代码特征相关（默认使用模型训练时的配置，可选覆盖）
+    parser.add_argument('--use_code_feature', type=str, default=None, choices=['true', 'false'],
+                        help='是否启用设计源码嵌入特征（默认使用模型保存的配置）')
+    parser.add_argument('--code_model_path', type=str, default=None,
+                        help='代码特征模型路径（启用代码特征时必填；默认使用模型保存的路径）')
+    parser.add_argument('--code_cache_root', type=str, default=None,
+                        help='代码嵌入缓存根目录（默认跟随 cache_root）')
+    parser.add_argument('--code_pooling', type=str, default=None, choices=['last_token', 'mean'],
+                        help='代码特征 pooling 策略')
+    parser.add_argument('--code_max_length', type=int, default=None, help='代码序列最大长度')
+    parser.add_argument('--code_normalize', type=str, default=None, choices=['true', 'false'],
+                        help='是否对代码特征做 L2 归一化')
+    parser.add_argument('--code_batch_size', type=int, default=None, help='预编码代码特征批大小')
+    parser.add_argument('--graph_pooling', type=str, default=None,
+                        choices=['sum', 'mean', 'max', 'attention', 'set2set'],
+                        help='图池化方式（默认使用模型训练时的配置）')
+    parser.add_argument('--apply_hard_filter', type=str, default=None, choices=['true', 'false'],
+                        help='是否对评估集做 p05-p95 硬过滤（默认沿用模型训练配置）')
     
     args = parser.parse_args()
     
@@ -181,8 +199,33 @@ def main():
     else:
         raise ValueError("评估失败：无法解析 'region' 配置类型，期望为 bool 或 str(on/off)。")
     
+    # 代码特征 / 池化等模型配置（使用训练时配置，可被CLI覆盖）
+    use_code_feature = parse_bool_flag(args.use_code_feature, parse_bool_flag(saved_args.get('use_code_feature', False), False))
+    code_model_path = args.code_model_path or saved_args.get('code_model_path')
+    code_cache_root = args.code_cache_root or args.cache_root
+    code_pooling = args.code_pooling or saved_args.get('code_pooling', 'last_token')
+    code_max_length = args.code_max_length if args.code_max_length is not None else saved_args.get('code_max_length', 2048)
+    code_normalize = parse_bool_flag(args.code_normalize, parse_bool_flag(saved_args.get('code_normalize', False), False))
+    code_batch_size = args.code_batch_size if args.code_batch_size is not None else saved_args.get('code_batch_size', 8)
+    graph_pooling = args.graph_pooling or saved_args.get('graph_pooling', 'sum')
+    kernel_baseline = saved_args.get('kernel_baseline', 'learned')
+    differential_mode = parse_bool_flag(saved_args.get('differential', True), True)
+
+    if use_code_feature and not code_model_path:
+        raise ValueError("评估失败：模型开启了 use_code_feature，但未提供 code_model_path。请通过 --code_model_path 指定。")
+    
+    # 记录解析后的配置，便于后续保存
+    args.use_code_feature = use_code_feature
+    args.code_model_path = code_model_path
+    args.code_cache_root = code_cache_root
+    args.code_pooling = code_pooling
+    args.code_max_length = code_max_length
+    args.code_normalize = code_normalize
+    args.code_batch_size = code_batch_size
+    args.graph_pooling = graph_pooling
+
     print(f"自动加载模型配置: hierarchical={hierarchical_flag}, region={region_flag}")
-    target_metric = model_config['target_metric']
+    target_metric = canonical_metric_name(model_config['target_metric'])
     print(f"评估目标指标: {target_metric.upper()}（与训练配置保持一致）")
     print(f"评估损失函数: {loss_type}")
     
@@ -213,10 +256,51 @@ def main():
         rebuild_cache=args.rebuild_cache,
         hierarchical=(hierarchical_flag == 'on'),
         region=(region_flag == 'on'),
-        max_workers=(None if args.max_workers <= 0 else args.max_workers)
+        max_workers=(None if args.max_workers <= 0 else args.max_workers),
+        use_code_feature=use_code_feature,
+        code_model_path=code_model_path,
+        code_cache_root=code_cache_root,
+        code_pooling=code_pooling,
+        code_max_length=code_max_length,
+        code_normalize=code_normalize,
+        code_batch_size=code_batch_size,
+        graph_pooling=graph_pooling
     )
     
     eval_pairs = processor.collect_all_data()
+    # 若流水线异常返回空，但缓存存在，则尝试直接从缓存加载
+    if not eval_pairs:
+        eval_pairs = processor._load_cached_pairs(materialize=True)
+    if use_code_feature and eval_pairs:
+        eval_pairs = processor.attach_code_features(eval_pairs)
+
+    apply_hard_filter = parse_bool_flag(args.apply_hard_filter, parse_bool_flag(saved_args.get('apply_hard_filter', True), True))
+    if apply_hard_filter and eval_pairs:
+        thresholds = {}
+        try:
+            metric_idx = METRIC_INDEX[target_metric]
+            delta_key = f"{target_metric}_delta"
+            stats = _extract_metric_values(eval_pairs, metric_idx, delta_key)
+            stats_basic = {k: _compute_basic_stats(vals) for k, vals in stats.items()}
+            thresholds = {k: (v["p05"], v["p95"]) for k, v in stats_basic.items() if v}
+        except Exception as exc:
+            print(f"[Eval] 计算硬过滤阈值失败，将跳过过滤: {exc}")
+    
+        if thresholds:
+            filtered = []
+            for pair in eval_pairs:
+                vals = _extract_metric_values([pair], metric_idx, delta_key)
+                keep = True
+                for key, (low, high) in thresholds.items():
+                    value = vals[key][0]
+                    if value < low or value > high:
+                        keep = False
+                        break
+                if keep:
+                    filtered.append(pair)
+            dropped = len(eval_pairs) - len(filtered)
+            eval_pairs = filtered
+            print(f"[Eval] 硬过滤(p05-p95) 移除 {dropped} 条，剩余 {len(eval_pairs)} 条")
     
     if not eval_pairs:
         print("错误: 未找到有效的评估数据配对")
@@ -227,10 +311,23 @@ def main():
     # 获取一个样本以确定节点维度
     sample_pair = eval_pairs[0]
     node_dim = sample_pair['kernel_graph'].x.size(1)
+    code_dim = None
+    if use_code_feature:
+        sample_code = sample_pair.get('design_code_embedding')
+        if sample_code is None:
+            raise ValueError("评估失败：use_code_feature=True 但样本缺少 design_code，请检查代码特征缓存或提供正确的 code_model_path。")
+        code_dim = sample_code.shape[-1]
     
     # 如果模型配置中没有node_dim，更新它
     if model_config['node_dim'] is None:
         model_config['node_dim'] = node_dim
+    model_config.update({
+        'graph_pooling': graph_pooling,
+        'kernel_baseline': kernel_baseline,
+        'differential': differential_mode,
+        'use_code_feature': use_code_feature,
+        'code_dim': code_dim
+    })
     
     # ==================== 创建模型并加载权重 ====================
     print("\n创建模型...")
@@ -242,7 +339,10 @@ def main():
         target_metric=model_config['target_metric'],
         differential=model_config['differential'],
         gnn_type=model_config['gnn_type'],
-        kernel_baseline=model_config['kernel_baseline']
+        kernel_baseline=model_config['kernel_baseline'],
+        use_code_feature=use_code_feature,
+        code_dim=code_dim,
+        graph_pooling=graph_pooling
     ).to(device)
     
     # 加载模型权重
