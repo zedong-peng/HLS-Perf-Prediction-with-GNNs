@@ -108,6 +108,46 @@ def _signal_handler(signum, frame):
     print(f"收到信号 {signum}，准备安全退出...")
     raise KeyboardInterrupt
 
+
+def _maybe_raise_nofile_limit(min_soft: int = 65000):
+    """Try to raise the file descriptor soft limit to avoid SIGTERM during graph builds."""
+    try:
+        import resource
+    except ImportError:
+        return None
+
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        infinite = getattr(resource, "RLIM_INFINITY", -1)
+        if soft >= min_soft:
+            return (soft, hard)
+
+        target_soft = min_soft
+        if hard not in (-1, infinite):
+            target_soft = min(min_soft, hard)
+
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target_soft, hard))
+        log_status(f"[Resource] Raised RLIMIT_NOFILE from {soft} to {target_soft} (hard={hard})")
+        return (soft, hard)
+    except Exception as exc:
+        log_status(f"[Resource] Failed to raise RLIMIT_NOFILE: {exc}")
+        return None
+
+
+def _restore_nofile_limit(original_limits: Optional[Tuple[int, int]]):
+    """Restore RLIMIT_NOFILE on exit to avoid surprising global settings."""
+    if not original_limits:
+        return
+    try:
+        import resource
+    except ImportError:
+        return
+
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, original_limits)
+    except Exception as exc:
+        log_status(f"[Resource] Failed to restore RLIMIT_NOFILE: {exc}")
+
 signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
 atexit.register(_graceful_cleanup)
@@ -180,7 +220,7 @@ class E2EDifferentialProcessor:
                  cache_root: str = "./graph_cache", rebuild_cache: bool = False, hierarchical: bool = False, region: bool = False, max_workers: Optional[int] = None,
                  use_code_feature: bool = False, code_model_path: Optional[str] = None, code_cache_root: Optional[str] = None,
                  code_pooling: str = "last_token", code_max_length: int = 2048, code_normalize: bool = True, code_batch_size: int = 8,
-                 graph_pooling: str = "sum"):
+                 graph_pooling: str = "sum", filter_resource_mismatch: bool = False):
         self.kernel_base_dir = kernel_base_dir
         self.design_base_dir = design_base_dir
         self.output_dir = output_dir
@@ -198,6 +238,7 @@ class E2EDifferentialProcessor:
         self.code_cache_dir = os.path.join(self.code_cache_root, "code_embeddings")
         os.makedirs(self.code_cache_dir, exist_ok=True)
         self._code_embedder = None
+        self.filter_resource_mismatch = bool(filter_resource_mismatch)
         
         # 并行线程数（仅 CLI 配置；<=0 或 None 则自动）
         if isinstance(max_workers, int) and max_workers > 0:
@@ -211,7 +252,7 @@ class E2EDifferentialProcessor:
         kb = os.path.abspath(self.kernel_base_dir)
         db = os.path.abspath(self.design_base_dir)
         # 在cache key中加入特征版本，避免特征维度变化导致旧缓存失配；图缓存不绑定代码特征，便于独立演进
-        feature_version = "featv=20250924.1"
+        feature_version = "featv=20250115.1"  # bump when节点特征/资源过滤逻辑变更
         cache_key_src = f"kb={kb}|db={db}|hier={'1' if self.hierarchical else '0'}|region={'1' if self.region else '0'}|{feature_version}"
         cache_key = hashlib.md5(cache_key_src.encode("utf-8")).hexdigest()[:12]
         self.graph_cache_dir = os.path.join(cache_root, cache_key)
@@ -588,6 +629,12 @@ class E2EDifferentialProcessor:
         if processed_pairs > 0 and os.path.exists(self.index_path):
             log_status(f"[Step3.5] 图缓存与配对完成，共生成 {processed_pairs} 条记录，已写入缓存目录 {self.graph_cache_dir}")
             return self._load_cached_pairs(limit=limit, materialize=materialize)
+        # 进程池/线程池阶段未生成新样本时，尝试用已有 pair 文件重建索引，避免丢失旧缓存
+        if processed_pairs == 0 and os.path.isdir(self.pairs_dir) and any(Path(self.pairs_dir).glob("*.pt")):
+            restored = self._rebuild_index_from_pairs()
+            if restored > 0 and os.path.exists(self.index_path):
+                log_status(f"[Step3.5] 未生成新配对，使用已有缓存重建索引，恢复 {restored} 条记录")
+                return self._load_cached_pairs(limit=limit, materialize=materialize)
 
         return []
 
@@ -624,6 +671,7 @@ class E2EDifferentialProcessor:
             graph_data = self._process_graphs(graph_files)
             if not graph_data:
                 return None
+            adb_dsp_sum = self._sum_dsp_from_adb(graph_files)
             
             return {
                 'type': 'kernel',
@@ -632,7 +680,8 @@ class E2EDifferentialProcessor:
                 'base_path': str(kernel_path),
                 'performance': perf_data,
                 'graph': graph_data,
-                'pragma_info': {'pragma_count': 0}  # kernel没有pragma
+                'pragma_info': {'pragma_count': 0},  # kernel没有pragma
+                'adb_dsp_sum': adb_dsp_sum
             }
             
         except Exception as e:
@@ -660,6 +709,7 @@ class E2EDifferentialProcessor:
             graph_data = self._process_graphs(graph_files)
             if not graph_data:
                 return None
+            adb_dsp_sum = self._sum_dsp_from_adb(graph_files)
             
             # 提取pragma信息
             pragma_info = self._extract_pragma_info(design_path)
@@ -674,7 +724,8 @@ class E2EDifferentialProcessor:
                 'graph': graph_data,
                 'pragma_info': pragma_info,
                 'design_code_embedding': None,
-                'code_hash': None
+                'code_hash': None,
+                'adb_dsp_sum': adb_dsp_sum
             }
             
         except Exception as e:
@@ -849,6 +900,49 @@ class E2EDifferentialProcessor:
         except Exception as e:
             print(f"并图失败: {e}")
             return None
+
+    def _sum_dsp_from_adb(self, adb_paths: List[Path]) -> Optional[int]:
+        """汇总一组 ADB 文件中的 DSP 资源数（来自 dp_component_resource）。"""
+        total = 0
+        found = False
+        for adb_path in adb_paths:
+            try:
+                tree = ET.parse(adb_path)
+                root = tree.getroot()
+                for dcr in root.iter('dp_component_resource'):
+                    for item in dcr.findall('item'):
+                        second = item.find('second')
+                        if second is None:
+                            continue
+                        for res_item in second.findall('item'):
+                            if res_item.findtext('first') == 'DSP':
+                                val = res_item.findtext('second')
+                                try:
+                                    total += int(val)
+                                    found = True
+                                except Exception:
+                                    continue
+            except Exception:
+                try:
+                    text = adb_path.read_text(encoding='utf-8', errors='ignore')
+                except Exception:
+                    continue
+                for m in re.finditer(r"<first>DSP</first>\s*<second>(\d+)</second>", text):
+                    total += int(m.group(1))
+                    found = True
+        return total if found else None
+
+    def _compute_adb_dsp_from_path(self, base_path: Optional[str]) -> Optional[int]:
+        """在已有缓存缺少 adb_dsp_sum 时，尝试重新扫描 base_path 下的 ADB 以获取 DSP 总和。"""
+        if not base_path:
+            return None
+        try:
+            adb_files = [p for p in Path(base_path).rglob("*.adb") if p.name.count('.') <= 1]
+            if not adb_files:
+                return None
+            return self._sum_dsp_from_adb(adb_files)
+        except Exception:
+            return None
     
     def _extract_pragma_info(self, design_path: Path) -> Dict:
         """提取pragma信息"""
@@ -928,6 +1022,14 @@ class E2EDifferentialProcessor:
             # 添加性能标签到图数据 - 使用原始值，不进行归一化
             kernel_graph = kernel_data['graph']
             design_graph = design_data['graph']
+
+            if getattr(self, 'filter_resource_mismatch', False):
+                def _mismatch(expected, summed):
+                    return summed is not None and expected is not None and expected != summed
+                if _mismatch(k_perf['DSP'], kernel_data.get('adb_dsp_sum')):
+                    return None
+                if _mismatch(d_perf['DSP'], design_data.get('adb_dsp_sum')):
+                    return None
             
             kernel_graph.y = torch.tensor([
                 k_perf['DSP'],
@@ -1104,6 +1206,23 @@ class E2EDifferentialProcessor:
             return False
         if not self._is_performance_within_available(design_perf):
             return False
+        if getattr(self, 'filter_resource_mismatch', False):
+            try:
+                # 优先使用缓存的 adb_dsp_sum，缺失时尝试重算
+                k_sum = payload.get('kernel_info', {}).get('adb_dsp_sum')
+                d_sum = payload.get('design_info', {}).get('adb_dsp_sum')
+                if k_sum is None:
+                    k_sum = self._compute_adb_dsp_from_path(payload.get('kernel_info', {}).get('base_path'))
+                if d_sum is None:
+                    d_sum = self._compute_adb_dsp_from_path(payload.get('design_info', {}).get('base_path'))
+                k_dsp = kernel_perf.get('DSP') if kernel_perf else None
+                d_dsp = design_perf.get('DSP') if design_perf else None
+                def _mismatch(expected, summed):
+                    return summed is not None and expected is not None and expected != summed
+                if _mismatch(k_dsp, k_sum) or _mismatch(d_dsp, d_sum):
+                    return False
+            except Exception:
+                pass
         return True
 
     def _attach_design_code(self, payload: Dict) -> Dict:
@@ -2134,7 +2253,13 @@ def main():
     parser.add_argument('--warmup_epochs', type=int, default=10, help='Linear warmup 的 epoch 数（0 表示关闭）')
     parser.add_argument('--min_lr', type=float, default=1e-4, help='学习率下限（避免过小导致训练停滞）')
     parser.add_argument('--apply_hard_filter', type=str, default='true', choices=['true', 'false'],
-                        help='是否过滤无效设计（基于稳健分位 p05-p95）')
+                        help='是否过滤无效设计（基于稳健分位，默认p05-p95）')
+    parser.add_argument('--hard_filter_low_q', type=float, default=5.0,
+                        help='硬过滤下界分位点（0-100，例如25表示p25）')
+    parser.add_argument('--hard_filter_high_q', type=float, default=95.0,
+                        help='硬过滤上界分位点（0-100，例如95表示p95）')
+    parser.add_argument('--filter_resource_mismatch', type=str, default='false', choices=['true', 'false'],
+                        help='当 adb 细分 DSP 总和与 csynth 总 DSP 不一致时是否过滤样本（默认不过滤）')
     parser.add_argument('--normalize_targets', type=str, default='true', choices=['true', 'false'],
                         help='是否对目标值/差值使用稳健归一化（median/IQR）用于计算loss')
     
@@ -2149,7 +2274,7 @@ def main():
                         help='图级池化方式，影响设计/kernel 表征汇聚')
 
     # 并行构建图cache参数
-    parser.add_argument('--max_workers', type=int, default=32,
+    parser.add_argument('--max_workers', type=int, default=24,
                         help='数据处理并行线程/进程数（<=0 表示自动选择）')
     
     # 模型保存选项
@@ -2163,6 +2288,10 @@ def main():
     code_normalize = (args.code_normalize.lower() == 'true')
     if use_code_feature and not args.code_model_path:
         raise ValueError("use_code_feature=true 时必须提供 --code_model_path")
+
+    original_rlimit = _maybe_raise_nofile_limit(60000)
+    if original_rlimit:
+        atexit.register(_restore_nofile_limit, original_rlimit)
 
     _configure_mp(args.loader_start_method)
     
@@ -2201,7 +2330,9 @@ def main():
         code_pooling=args.code_pooling,
         code_max_length=args.code_max_length,
         code_normalize=code_normalize,
-        code_batch_size=args.code_batch_size
+        code_batch_size=args.code_batch_size,
+        graph_pooling=args.graph_pooling,
+        filter_resource_mismatch=(args.filter_resource_mismatch.lower() == 'true')
     )
     
     # 收集配对数据
@@ -2214,6 +2345,12 @@ def main():
         pairs = processor.attach_code_features(pairs)
         log_status(f"[Step3.6] 代码缓存对齐完成，可用样本 {len(pairs)} 条")
     
+    if args.filter_resource_mismatch.lower() == 'true':
+        log_status(f"[Step3.7] 启用资源一致性过滤（ADB DSP vs csynth DSP），过滤后样本 {len(pairs)} 条")
+        swanlab.log({"dataset/filter_resource_mismatch": "true"})
+    else:
+        swanlab.log({"dataset/filter_resource_mismatch": "false"})
+
     if not pairs:
         print("错误: 未找到有效的kernel-design配对")
         swanlab.finish()
@@ -2237,7 +2374,9 @@ def main():
             code_pooling=args.code_pooling,
             code_max_length=args.code_max_length,
             code_normalize=code_normalize,
-            code_batch_size=args.code_batch_size
+            code_batch_size=args.code_batch_size,
+            graph_pooling=args.graph_pooling,
+            filter_resource_mismatch=(args.filter_resource_mismatch.lower() == 'true')
         )
         log_status("[Step5] 开始构建/加载OOD图缓存并生成kernel-design配对")
         ood_pairs = ood_processor.collect_all_data()
@@ -2280,9 +2419,46 @@ def main():
     swanlab.log({f"stats/raw/{k}/p05": v.get("p05", float('nan')) for k, v in raw_stats.items() if v})
     swanlab.log({f"stats/raw/{k}/p95": v.get("p95", float('nan')) for k, v in raw_stats.items() if v})
 
-    # p05-p95 硬过滤（保持 10% avail 过滤基础上）
+    # 分位硬过滤（默认 p05-p95，可通过 CLI 调整）
     if args.apply_hard_filter.lower() == 'true':
-        thresholds = {k: (v["p05"], v["p95"]) for k, v in raw_stats.items() if v}
+        def _pick_quantile(stats: Dict[str, float], q: float, key: str) -> float:
+            # 支持常用分位：p05/p25/median(p50)/p75/p95
+            q_rounded = round(float(q))
+            mapping = {
+                5: "p05",
+                25: "p25",
+                50: "median",
+                75: "p75",
+                95: "p95",
+            }
+            if q_rounded not in mapping:
+                raise ValueError(f"hard_filter_{key}_q 仅支持 5/25/50/75/95，当前为 {q}")
+            stat_key = mapping[q_rounded]
+            if stat_key not in stats:
+                raise ValueError(f"统计缺少 {stat_key}，无法执行硬过滤")
+            return stats[stat_key]
+
+        low_q = float(args.hard_filter_low_q)
+        high_q = float(args.hard_filter_high_q)
+        if not (0.0 <= low_q < high_q <= 100.0):
+            raise ValueError(f"硬过滤分位范围非法: low_q={low_q}, high_q={high_q}")
+
+        thresholds = {}
+        for key, v in raw_stats.items():
+            if not v:
+                continue
+            low = _pick_quantile(v, low_q, "low")
+            high = _pick_quantile(v, high_q, "high")
+            thresholds[key] = (low, high)
+        swanlab.log({
+            "dataset/hard_filter_low_q": low_q,
+            "dataset/hard_filter_high_q": high_q,
+        })
+        for key, (low, high) in thresholds.items():
+            swanlab.log({
+                f"dataset/hard_filter/{key}/low": low,
+                f"dataset/hard_filter/{key}/high": high,
+            })
         before = len(pairs)
         filtered_pairs: List[Dict] = []
         for pair in pairs:
@@ -2297,7 +2473,7 @@ def main():
                 filtered_pairs.append(pair)
         pairs = filtered_pairs
         dropped = before - len(pairs)
-        log_status(f"[Step4.1] 过滤无效设计（p05-p95），移除 {dropped} 条，剩余 {len(pairs)} 条")
+        log_status(f"[Step4.1] 过滤无效设计（p{low_q:.0f}-p{high_q:.0f}），移除 {dropped} 条，剩余 {len(pairs)} 条")
         swanlab.log({
             "dataset/hard_filter_dropped": dropped,
             "dataset/after_hard_filter": len(pairs)
@@ -2364,7 +2540,8 @@ def main():
     swanlab.log({
         "dataset/train_size": len(train_dataset),
         "dataset/valid_size": len(valid_dataset), 
-        "dataset/test_size": len(test_dataset)
+        "dataset/test_size": len(test_dataset),
+        "dataset/filter_resource_mismatch": args.filter_resource_mismatch.lower()
     })
     
     # 不再以表格形式记录数据集划分；仅保留标量日志

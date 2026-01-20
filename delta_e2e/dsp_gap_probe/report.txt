@@ -1,0 +1,52 @@
+Design symm_design_1001
+  csynth DSP: 94
+  ADB raw DSP sum: 82
+  ADB adjusted DSP (naive unroll): 82
+  Nodes (adb, name, dsp, factor, adjusted):
+    kernel_symm.adb: dadd_64ns_64ns_64_3_full_dsp_1_U1 (dadd_64ns_64ns_64_3_full_dsp_1) dsp=3 factor=1 adj=3
+    kernel_symm.adb: dadd_64ns_64ns_64_3_full_dsp_1_U2 (dadd_64ns_64ns_64_3_full_dsp_1) dsp=3 factor=1 adj=3
+    kernel_symm.adb: dadd_64ns_64ns_64_3_full_dsp_1_U3 (dadd_64ns_64ns_64_3_full_dsp_1) dsp=3 factor=1 adj=3
+    kernel_symm.adb: dadd_64ns_64ns_64_3_full_dsp_1_U4 (dadd_64ns_64ns_64_3_full_dsp_1) dsp=3 factor=1 adj=3
+    kernel_symm.adb: dadd_64ns_64ns_64_3_full_dsp_1_U5 (dadd_64ns_64ns_64_3_full_dsp_1) dsp=3 factor=1 adj=3
+    kernel_symm.adb: dmul_64ns_64ns_64_4_max_dsp_1_U10 (dmul_64ns_64ns_64_4_max_dsp_1) dsp=8 factor=1 adj=8
+    kernel_symm.adb: dmul_64ns_64ns_64_4_max_dsp_1_U11 (dmul_64ns_64ns_64_4_max_dsp_1) dsp=8 factor=1 adj=8
+    kernel_symm.adb: dmul_64ns_64ns_64_4_max_dsp_1_U12 (dmul_64ns_64ns_64_4_max_dsp_1) dsp=8 factor=1 adj=8
+    kernel_symm.adb: dmul_64ns_64ns_64_4_max_dsp_1_U13 (dmul_64ns_64ns_64_4_max_dsp_1) dsp=8 factor=1 adj=8
+    kernel_symm.adb: dmul_64ns_64ns_64_4_max_dsp_1_U6 (dmul_64ns_64ns_64_4_max_dsp_1) dsp=8 factor=1 adj=8
+    kernel_symm.adb: dmul_64ns_64ns_64_4_max_dsp_1_U7 (dmul_64ns_64ns_64_4_max_dsp_1) dsp=8 factor=1 adj=8
+    kernel_symm.adb: dmul_64ns_64ns_64_4_max_dsp_1_U8 (dmul_64ns_64ns_64_4_max_dsp_1) dsp=8 factor=1 adj=8
+    kernel_symm.adb: dmul_64ns_64ns_64_4_max_dsp_1_U9 (dmul_64ns_64ns_64_4_max_dsp_1) dsp=8 factor=1 adj=8
+    kernel_symm.adb: mul_8ns_12ns_19_1_1_U15 (mul_8ns_12ns_19_1_1) dsp=1 factor=1 adj=1
+    kernel_symm.adb: mul_9ns_12ns_20_1_1_U16 (mul_9ns_12ns_20_1_1) dsp=1 factor=1 adj=1
+    kernel_symm.adb: mul_9ns_12ns_20_1_1_U17 (mul_9ns_12ns_20_1_1) dsp=1 factor=1 adj=1
+
+Design syr2k_design_312
+  csynth DSP: 49
+  ADB raw DSP sum: 43
+  ADB adjusted DSP (naive unroll): 43
+  Nodes (adb, name, dsp, factor, adjusted):
+    kernel_syr2k.adb: dadd_64ns_64ns_64_3_full_dsp_1_U1 (dadd_64ns_64ns_64_3_full_dsp_1) dsp=3 factor=1 adj=3
+    kernel_syr2k.adb: dadd_64ns_64ns_64_3_full_dsp_1_U2 (dadd_64ns_64ns_64_3_full_dsp_1) dsp=3 factor=1 adj=3
+    kernel_syr2k.adb: dmul_64ns_64ns_64_4_max_dsp_1_U3 (dmul_64ns_64ns_64_4_max_dsp_1) dsp=8 factor=1 adj=8
+    kernel_syr2k.adb: dmul_64ns_64ns_64_4_max_dsp_1_U4 (dmul_64ns_64ns_64_4_max_dsp_1) dsp=8 factor=1 adj=8
+    kernel_syr2k.adb: dmul_64ns_64ns_64_4_max_dsp_1_U5 (dmul_64ns_64ns_64_4_max_dsp_1) dsp=8 factor=1 adj=8
+    kernel_syr2k.adb: dmul_64ns_64ns_64_4_max_dsp_1_U6 (dmul_64ns_64ns_64_4_max_dsp_1) dsp=8 factor=1 adj=8
+    kernel_syr2k.adb: mul_11ns_12ns_21_1_1_U10 (mul_11ns_12ns_21_1_1) dsp=1 factor=1 adj=1
+    kernel_syr2k.adb: mul_11ns_12ns_21_1_1_U7 (mul_11ns_12ns_21_1_1) dsp=1 factor=1 adj=1
+    kernel_syr2k.adb: mul_11ns_9ns_19_1_1_U11 (mul_11ns_9ns_19_1_1) dsp=1 factor=1 adj=1
+    kernel_syr2k.adb: mul_11ns_9ns_19_1_1_U8 (mul_11ns_9ns_19_1_1) dsp=1 factor=1 adj=1
+    kernel_syr2k.adb: mul_9ns_11ns_19_1_1_U9 (mul_9ns_11ns_19_1_1) dsp=1 factor=1 adj=1
+
+Design trmm_design_892
+  csynth DSP: 51
+  ADB raw DSP sum: 23
+  ADB adjusted DSP (naive unroll): 23
+  Nodes (adb, name, dsp, factor, adjusted):
+    kernel_trmm.adb: dadd_64ns_64ns_64_3_full_dsp_1_U1 (dadd_64ns_64ns_64_3_full_dsp_1) dsp=3 factor=1 adj=3
+    kernel_trmm.adb: dmul_64ns_64ns_64_4_max_dsp_1_U2 (dmul_64ns_64ns_64_4_max_dsp_1) dsp=8 factor=1 adj=8
+    kernel_trmm.adb: dmul_64ns_64ns_64_4_max_dsp_1_U3 (dmul_64ns_64ns_64_4_max_dsp_1) dsp=8 factor=1 adj=8
+    kernel_trmm.adb: mul_10ns_12ns_21_1_1_U10 (mul_10ns_12ns_21_1_1) dsp=1 factor=1 adj=1
+    kernel_trmm.adb: mul_10ns_12ns_21_1_1_U15 (mul_10ns_12ns_21_1_1) dsp=1 factor=1 adj=1
+    kernel_trmm.adb: mul_10ns_12ns_21_1_1_U4 (mul_10ns_12ns_21_1_1) dsp=1 factor=1 adj=1
+    kernel_trmm.adb: mul_10ns_12ns_21_1_1_U5 (mul_10ns_12ns_21_1_1) dsp=1 factor=1 adj=1
+

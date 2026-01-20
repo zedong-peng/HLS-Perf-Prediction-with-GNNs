@@ -112,6 +112,22 @@ def to_serializable(value: Any):
     return value
 
 
+def load_normalizers_from_stats(model_path: str):
+    """从模型目录的 target_metric_stats.json 中加载 median/scale 正则化配置。"""
+    model_dir = os.path.dirname(os.path.abspath(model_path))
+    stats_path = os.path.join(model_dir, "target_metric_stats.json")
+    if not os.path.exists(stats_path):
+        return None
+    try:
+        stats = json.load(open(stats_path, 'r'))
+        norm = stats.get("normalizer", {})
+        if not norm:
+            return None
+        return norm
+    except Exception:
+        return None
+
+
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='评估训练好的差分学习GNN模型')
@@ -158,6 +174,10 @@ def main():
                         help='图池化方式（默认使用模型训练时的配置）')
     parser.add_argument('--apply_hard_filter', type=str, default=None, choices=['true', 'false'],
                         help='是否对评估集做 p05-p95 硬过滤（默认沿用模型训练配置）')
+    parser.add_argument('--use_normalizer', type=str, default='true', choices=['true', 'false'],
+                        help='是否从 target_metric_stats.json 加载 normalizer 用于评估')
+    parser.add_argument('--filter_resource_mismatch', type=str, default=None, choices=['true', 'false'],
+                        help='当 adb 细分 DSP 总和与 csynth DSP 不一致时是否过滤样本（默认沿用模型训练配置）')
     
     args = parser.parse_args()
     
@@ -264,7 +284,8 @@ def main():
         code_max_length=code_max_length,
         code_normalize=code_normalize,
         code_batch_size=code_batch_size,
-        graph_pooling=graph_pooling
+        graph_pooling=graph_pooling,
+        filter_resource_mismatch=filter_resource_mismatch
     )
     
     eval_pairs = processor.collect_all_data()
@@ -275,6 +296,7 @@ def main():
         eval_pairs = processor.attach_code_features(eval_pairs)
 
     apply_hard_filter = parse_bool_flag(args.apply_hard_filter, parse_bool_flag(saved_args.get('apply_hard_filter', True), True))
+    filter_resource_mismatch = parse_bool_flag(args.filter_resource_mismatch, parse_bool_flag(saved_args.get('filter_resource_mismatch', False), False))
     if apply_hard_filter and eval_pairs:
         thresholds = {}
         try:
@@ -349,6 +371,9 @@ def main():
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     print("模型权重加载完成")
+    normalizers = None
+    if args.use_normalizer.lower() == 'true':
+        normalizers = load_normalizers_from_stats(args.model_path)
     
     # ==================== 创建数据集和数据加载器 ====================
     dataset = E2EDifferentialDataset(eval_pairs, model_config['target_metric'])
@@ -378,7 +403,8 @@ def main():
         model, eval_loader, device, 
         target_metric=model_config['target_metric'],
         return_predictions=False,
-        loss_fn=loss_fn
+        loss_fn=loss_fn,
+        normalizers=normalizers
     )
     
     # ==================== 保存结果 ====================

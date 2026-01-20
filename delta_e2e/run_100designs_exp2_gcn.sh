@@ -17,16 +17,17 @@ trap cleanup SIGINT SIGTERM
 
 
 
-features=("dsp" "ff" "lut")
-# exp1: origin GNN
-differentials=("false")
+features=("lut")
+
+# exp2: delta GNN
+differentials=("true")
 hierarchical=("off")
 region=("on")
 use_code_feature=("False")
 
 # from fast to slow
 # gnn=("gcn" "fast_rgcn" "rgcn" "gin" "pna")
-gnn=("pna")
+gnn=("graphsage")
 
 
 # design_base_dir

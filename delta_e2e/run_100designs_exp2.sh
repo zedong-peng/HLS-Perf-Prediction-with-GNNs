@@ -17,7 +17,7 @@ trap cleanup SIGINT SIGTERM
 
 
 
-features=("dsp" "ff" "lut")
+features=("ff")
 
 # exp2: delta GNN
 differentials=("true")
@@ -52,7 +52,7 @@ for differential in "${differentials[@]}"; do
           --output_dir ./output \
           --cache_root ./graph_cache \
           --gnn_type $gnn_type \
-          --epochs 300 \
+          --epochs 200 \
           --batch_size 16 \
           --hidden_dim 128 \
           --num_layers 2 \

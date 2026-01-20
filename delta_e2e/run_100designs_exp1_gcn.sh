@@ -26,7 +26,7 @@ use_code_feature=("False")
 
 # from fast to slow
 # gnn=("gcn" "fast_rgcn" "rgcn" "gin" "pna")
-gnn=("pna")
+gnn=("graphsage")
 
 
 # design_base_dir

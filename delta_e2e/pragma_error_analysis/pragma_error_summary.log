@@ -1,0 +1,37 @@
+Total samples: 1292
+Overall MAE: 17.747650, Overall MAPE: 494026466.121984
+
+Per-kernel MAE/MAPE:
+  floyd-warshall: MAE=7.739312, MAPE=12765643209.968254, n=50
+  cholesky: MAE=8.931927, MAPE=63.282223, n=50
+  durbin: MAE=7.846777, MAPE=62.578214, n=50
+  seidel-2d: MAE=4.724550, MAPE=38.303777, n=50
+  gramschmidt: MAE=13.116708, MAPE=34.229355, n=50
+  nussinov: MAE=2.813930, MAPE=32.749155, n=50
+  trisolv: MAE=3.915024, MAPE=31.627833, n=50
+  syr2k: MAE=14.040554, MAPE=26.579257, n=50
+  trmm: MAE=11.843410, MAPE=26.454483, n=50
+  covariance: MAE=16.902521, MAPE=25.199444, n=50
+  syrk: MAE=9.940072, MAPE=24.790815, n=50
+  correlation: MAE=18.707411, MAPE=24.381402, n=44
+  jacobi-1d: MAE=5.337669, MAPE=24.235953, n=50
+  doitgen: MAE=3.403749, MAPE=22.379677, n=50
+  3mm: MAE=16.935608, MAPE=22.123118, n=50
+  ludcmp: MAE=11.683681, MAPE=21.748065, n=50
+  mvt: MAE=11.103710, MAPE=21.711859, n=50
+  deriche: MAE=16.580351, MAPE=21.625897, n=50
+  symm: MAE=13.269687, MAPE=21.617289, n=50
+  lu: MAE=8.554965, MAPE=20.993226, n=50
+  2mm: MAE=185.113436, MAPE=20.821313, n=50
+  heat-3d: MAE=16.288007, MAPE=19.797998, n=50
+  gemver: MAE=9.399339, MAPE=19.739060, n=48
+  jacobi-2d: MAE=11.929989, MAPE=17.859403, n=50
+  adi: MAE=19.048926, MAPE=17.375934, n=50
+  fdtd-2d: MAE=12.048822, MAPE=16.134379, n=50
+
+Top5 designs by MAPE:
+  PolyBench_floyd-warshall_design_362: MAPE=94027210752.000, MAE=9.403, path=/home/user/zedongpeng/workspace/Huggingface/forgehls_PolyBench_part_50designs/PolyBench/floyd-warshall/design_362
+  PolyBench_floyd-warshall_design_278: MAPE=93343604736.000, MAE=9.334, path=/home/user/zedongpeng/workspace/Huggingface/forgehls_PolyBench_part_50designs/PolyBench/floyd-warshall/design_278
+  PolyBench_floyd-warshall_design_754: MAPE=92630859776.000, MAE=9.263, path=/home/user/zedongpeng/workspace/Huggingface/forgehls_PolyBench_part_50designs/PolyBench/floyd-warshall/design_754
+  PolyBench_floyd-warshall_design_281: MAPE=92188958720.000, MAE=9.219, path=/home/user/zedongpeng/workspace/Huggingface/forgehls_PolyBench_part_50designs/PolyBench/floyd-warshall/design_281
+  PolyBench_floyd-warshall_design_155: MAPE=91557404672.000, MAE=9.156, path=/home/user/zedongpeng/workspace/Huggingface/forgehls_PolyBench_part_50designs/PolyBench/floyd-warshall/design_155

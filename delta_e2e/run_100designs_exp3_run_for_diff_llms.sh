@@ -16,23 +16,25 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 
-# features=("dsp" "ff" "lut")
-# features=("cp" "worst_latency")
-features=("dsp")
+
+features=("dsp" "ff" "lut")
 
 # exp3: delta GNN with code feature
 # code_model_path="/home/user/zedongpeng/workspace/GiT/zedong/Code-Verification/Qwen/Qwen2.5-Coder-1.5B-Instruct"
-code_model_path="/home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/delta_e2e/model/Qwen2.5-Coder-1.5B"
+# code_model_path=("/home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/delta_e2e/model/Qwen2.5-Coder-1.5B")
+
+# code_model_path=("/home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/delta_e2e/model/Qwen2.5-Coder-1.5B" "/home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/delta_e2e/model/Qwen2.5-1.5B" "/home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/delta_e2e/model/Llama-3.2-1B")
+code_model_path=("/home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/delta_e2e/model/Llama-3.2-1B")
+
 code_pooling="last_token"
 code_max_length=2048
-code_batch_size=2
+code_batch_size=8
 
 # from fast to slow
-# gnn=("gcn" "fast_rgcn" "rgcn" "gin" "pna" "graphsage" "gat")
+# gnn=("gcn" "fast_rgcn" "rgcn" "gin" "pna" "gat" "graphsage")
+# gnn=("pna")
 gnn=("graphsage")
 
-# graph_pooling_type=("sum" "max" "mean" "attention")
-graph_pooling_type=("sum")
 
 # design_base_dir
 # design_base_dir="/home/user/zedongpeng/workspace/Huggingface/forgehls_lite_100designs"
@@ -46,9 +48,9 @@ design_base_dir="/home/user/zedongpeng/workspace/Huggingface/forgehls_PolyBench_
 # 4090 当前配置下可稳定执行3个训练任务
 # --ood_design_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_benchmark \
 
-for feature in "${features[@]}"; do
+for llm_type in "${code_model_path[@]}"; do
   for gnn_type in "${gnn[@]}"; do
-    for graph_pooling in "${graph_pooling_type[@]}"; do
+    for feature in "${features[@]}"; do
       echo "Running exp3 (code feature): true | $feature | $gnn_type | off | on | code"
       python train_e2e.py \
       --kernel_base_dir /home/user/zedongpeng/workspace/Huggingface/forgehls_kernels \
@@ -56,25 +58,25 @@ for feature in "${features[@]}"; do
       --output_dir ./output \
       --cache_root ./graph_cache \
       --gnn_type $gnn_type \
-      --epochs 400 \
+      --epochs 450 \
       --batch_size 16 \
       --hidden_dim 128 \
       --num_layers 2 \
       --dropout 0.02 \
       --lr 5e-4 \
+      --min_lr 1e-4 \
       --target_metric $feature \
       --hierarchical off \
-      --region off \
+      --region on \
       --differential true \
       --kernel_baseline learned \
       --loss_type smoothl1 \
       --use_code_feature true \
-      --code_model_path "$code_model_path" \
+      --code_model_path "$llm_type" \
       --code_pooling "$code_pooling" \
       --code_max_length $code_max_length \
       --code_normalize false \
-      --code_batch_size $code_batch_size \
-      --graph_pooling $graph_pooling
+      --code_batch_size $code_batch_size
     done
   done
 done

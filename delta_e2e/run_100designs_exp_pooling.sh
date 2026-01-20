@@ -16,23 +16,22 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 
-# features=("dsp" "ff" "lut")
-# features=("cp" "worst_latency")
-features=("dsp")
+
+features=("worst_latency")
 
 # exp3: delta GNN with code feature
 # code_model_path="/home/user/zedongpeng/workspace/GiT/zedong/Code-Verification/Qwen/Qwen2.5-Coder-1.5B-Instruct"
 code_model_path="/home/user/zedongpeng/workspace/HLS-Perf-Prediction-with-GNNs/delta_e2e/model/Qwen2.5-Coder-1.5B"
 code_pooling="last_token"
 code_max_length=2048
-code_batch_size=2
+code_batch_size=8
 
 # from fast to slow
-# gnn=("gcn" "fast_rgcn" "rgcn" "gin" "pna" "graphsage" "gat")
+# gnn=("gcn" "fast_rgcn" "rgcn" "gin" "pna")
 gnn=("graphsage")
 
-# graph_pooling_type=("sum" "max" "mean" "attention")
-graph_pooling_type=("sum")
+# graph_pooling_type=("mean" "attention" "sum")
+graph_pooling_type=("max")
 
 # design_base_dir
 # design_base_dir="/home/user/zedongpeng/workspace/Huggingface/forgehls_lite_100designs"
@@ -64,7 +63,7 @@ for feature in "${features[@]}"; do
       --lr 5e-4 \
       --target_metric $feature \
       --hierarchical off \
-      --region off \
+      --region on \
       --differential true \
       --kernel_baseline learned \
       --loss_type smoothl1 \

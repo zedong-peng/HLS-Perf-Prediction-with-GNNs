@@ -26,4 +26,8 @@ baseline/progsg_e2e/progsg_runs
 baseline/HGNN/origin/
 
 delta_e2e/graph_cache
+delta_e2e/output
+delta_e2e/model
 graph_cache
+graph_cache_prag
+graph_cache_prag_code
